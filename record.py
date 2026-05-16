@@ -7,11 +7,12 @@ import depthai as dai
 import cv2
 import numpy as np
 import os, json, time, threading, queue
-import http.server, socketserver
-from urllib.parse import urlparse, parse_qs
 from datetime import timedelta
 import sys, select, termios, tty
 import math
+import ctypes
+import asyncio
+from aiohttp import web
 
 # IMPORT OUR CUSTOM MODULES
 from load_config import CFG
@@ -58,35 +59,15 @@ CR_REC = CR_CFG.get("apply_to_recording", True)
 ISP_WIDTH  = 960
 ISP_HEIGHT = 540
 
-# Optical Flow & Feature Tracker Tuned for Pi CPU efficiency
-lk_params = dict(
-    winSize=(21, 21),
-    maxLevel=3,
-    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-    minEigThreshold=1e-4
-)
-
-feature_params = dict(
-    maxCorners=150,
-    qualityLevel=0.02,
-    minDistance=15,
-    blockSize=9,
-    useHarrisDetector=True,
-    k=0.04
-)
-
 # ============================================================
 # SHARED STATE & BUFFERS
 # ============================================================
 latest_jpeg  = None
-jpeg_lock    = threading.Lock()
 recording_event = threading.Event()
 visual_queue = queue.Queue(maxsize=1)
 stop_event   = threading.Event()
 
 lk_queue = queue.Queue(maxsize=1)
-lk_result_queue = queue.Queue(maxsize=1)
-prev_mean_intensity = None
 disk_health = {"consecutive_drops": 0}
 
 cam_ctrl_lock = threading.Lock()
@@ -102,11 +83,12 @@ hud_telemetry = {
     "score": 1.0,
     "blur": 0.0,
     "depth_pct": 0.0,
-    "message": "AWAITING GRAVITY CALIBRATION",
-    "cpu_fallback": False 
+    "message": "AWAITING GRAVITY CALIBRATION"
 }
 hud_lock = threading.Lock()
 runtime_state = {"bad_streak_counter": 0} 
+
+latest_hud_jpeg = None
 
 # ============================================================
 # ZERO-COPY BUFFERS
@@ -114,6 +96,16 @@ runtime_state = {"bad_streak_counter": 0}
 MAX_FEATURES = 150
 pp_buffer = np.empty((MAX_FEATURES, 2), dtype=np.float32)
 pc_buffer = np.empty((MAX_FEATURES, 2), dtype=np.float32)
+
+# ============================================================
+# THREAD AFFINITY
+# ============================================================
+def pin_thread(core_id):
+    """Pin calling thread to a specific core."""
+    try:
+        os.sched_setaffinity(0, {core_id})
+    except AttributeError:
+        pass  # non-Linux systems
 
 # ============================================================
 # THREADS
@@ -131,18 +123,15 @@ def visual_worker(ekf, K_mat, T_ic, T_ci):
             break
             
         r, n = ekf.update_visual(item[0], item[1], item[2], K_mat, T_ic, T_ci, item[3])
-        if r: 
-            ok += 1
-        else: 
-            fail += 1
+        if r: ok += 1
+        else: fail += 1
         visual_queue.task_done()
 
 def imu_worker(device, ekf):
+    pin_thread(3)  # Core 3 dedicated to IMU/EKF
     q = device.getOutputQueue("imu", maxSize=100, blocking=False)
     ab = np.zeros(3, dtype=np.float64)
     gb = np.zeros(3, dtype=np.float64)
-    
-    last_overflow_warning = 0
     
     while not stop_event.is_set():
         try:
@@ -154,10 +143,8 @@ def imu_worker(device, ekf):
                     try:
                         ts = a.getTimestampDevice().total_seconds()
                     except AttributeError:
-                        try: 
-                            ts = a.timestamp.get().total_seconds()
-                        except AttributeError: 
-                            ts = time.monotonic()
+                        try: ts = a.timestamp.get().total_seconds()
+                        except AttributeError: ts = time.monotonic()
                             
                     ab[0], ab[1], ab[2] = a.x, a.y, a.z
                     gb[0], gb[1], gb[2] = g.x, g.y, g.z
@@ -165,181 +152,191 @@ def imu_worker(device, ekf):
             else:
                 time.sleep(0.001)
         except Exception as e:
-            if stop_event.is_set(): 
-                break
-            print(f"  [IMU] {e}")
+            if stop_event.is_set(): break
             time.sleep(0.01)
 
 def lk_worker():
+    # Gutted LK Fallback Thread
     while not stop_event.is_set():
         try:
-            prev_gray, gray_curr, fallback_pts_prev, prev_ts = lk_queue.get(timeout=0.1)
+            lk_queue.get(timeout=0.1)
         except queue.Empty:
             continue
-            
-        p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_curr, fallback_pts_prev, None, **lk_params)
-        
-        if p1 is not None and st is not None:
-            p0_back, st_back, _ = cv2.calcOpticalFlowPyrLK(gray_curr, prev_gray, p1, None, **lk_params)
-            
-            if p0_back is not None:
-                fb_error = np.linalg.norm(fallback_pts_prev - p0_back, axis=2).flatten()
-                valid_mask = (st.flatten() == 1) & (st_back.flatten() == 1) & (fb_error < 1.0)
-                
-                good_new = p1[valid_mask]
-                good_old = fallback_pts_prev[valid_mask]
-                
-                try:
-                    lk_result_queue.put_nowait((good_old, good_new, prev_ts))
-                except queue.Full:
-                    pass
 
-# ============================================================
-# WEB SERVER (DUAL STREAM + GUI SLIDER + HARDENED PARSING)
-# ============================================================
-class MJPEGHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed_path = urlparse(self.path)
-        
-        if parsed_path.path == '/set_wb':
-            try:
-                val = int(parse_qs(parsed_path.query)['v'][0])
-                with cam_ctrl_lock: cam_state["wb"] = max(2500, min(8000, val))
-            except Exception: pass
-            self.send_response(200); self.end_headers(); return
-
-        if parsed_path.path == '/set_exp':
-            try:
-                val = int(parse_qs(parsed_path.query)['v'][0])
-                with cam_ctrl_lock: cam_state["exp"] = max(1000, min(33000, val))
-            except Exception: pass
-            self.send_response(200); self.end_headers(); return
-
-        if parsed_path.path == '/set_iso':
-            try:
-                val = int(parse_qs(parsed_path.query)['v'][0])
-                with cam_ctrl_lock: cam_state["iso"] = max(100, min(1600, val))
-            except Exception: pass
-            self.send_response(200); self.end_headers(); return
-
-        if parsed_path.path == '/stream':
-            self.send_response(200)
-            self.send_header('Cache-Control', 'no-cache,private')
-            self.send_header('Content-Type', 'multipart/x-mixed-replace;boundary=FRAME')
-            self.end_headers()
-            try:
-                while not stop_event.is_set():
-                    with jpeg_lock: 
-                        fd = latest_jpeg
-                    if fd:
-                        self.wfile.write(b'--FRAME\r\nContent-Type:image/jpeg\r\n')
-                        self.wfile.write(f'Content-Length:{len(fd)}\r\n\r\n'.encode())
-                        self.wfile.write(fd)
-                        self.wfile.write(b'\r\n')
-                    time.sleep(0.05)
-            except Exception: 
-                pass
-                
-        elif parsed_path.path == '/hud':
-            self.send_response(200)
-            self.send_header('Cache-Control', 'no-cache,private')
-            self.send_header('Content-Type', 'multipart/x-mixed-replace;boundary=FRAME')
-            self.end_headers()
-            try:
-                while not stop_event.is_set():
-                    with hud_lock:
-                        frame_ref = latest_preview
-                        telem = hud_telemetry.copy()
-                    
-                    frame = frame_ref.copy() if frame_ref is not None else None
-                    
-                    if frame is not None:
-                        if CR_ENABLED and CR_HUD:
-                            frame = fast_underwater_restore(frame, CR_R_MAX, CR_G_MAX)
-                            
-                        h, w = frame.shape[:2]
-                        
-                        if telem["state"] == "GOOD":   color = (0, 255, 0)      
-                        elif telem["state"] == "WEAK": color = (0, 255, 255)    
-                        elif telem["state"] == "BAD":  color = (0, 0, 255)      
-                        else:                          color = (255, 255, 255)  
-                        
-                        cv2.rectangle(frame, (0, 0), (w, h), color, 6)
-                        cv2.putText(frame, f"STATE: {telem['state']}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                        cv2.putText(frame, f"LAPLV: {telem['blur']:.1f}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                        cv2.putText(frame, f"DEPTH: {telem['depth_pct']*100:.1f}%", (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                        
-                        if telem.get("cpu_fallback"):
-                            cv2.putText(frame, "CPU OPTICAL FLOW ACTIVE", (15, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-                        
-                        if recording_event.is_set():
-                            cv2.putText(frame, "REC", (w - 80, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
-                            cv2.circle(frame, (w - 100, 27), 8, (0, 0, 255), -1)
-                        
-                        cv2.drawMarker(frame, (w//2, h//2), (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
-                        
-                        if telem["message"]:
-                            text_size = cv2.getTextSize(telem["message"], cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
-                            text_x = (w - text_size[0]) // 2
-                            cv2.putText(frame, telem["message"], (text_x, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-
-                        _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                        fd = jpeg.tobytes()
-                        
-                        self.wfile.write(b'--FRAME\r\nContent-Type:image/jpeg\r\n')
-                        self.wfile.write(f'Content-Length:{len(fd)}\r\n\r\n'.encode())
-                        self.wfile.write(fd)
-                        self.wfile.write(b'\r\n')
-                        
-                    time.sleep(0.1) 
-            except Exception: 
-                pass
-                
-        else:
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            
-            html = f'''<html><head><style>
-                body {{ background: #0b0b0b; color: #ececec; font-family: sans-serif; margin: 0; padding: 10px; text-align: center; overflow-x: hidden; }}
-                h2 {{ font-size: 1.0em; margin: 10px 0; color: #888; text-transform: uppercase; letter-spacing: 2px; }}
-                .control-bar {{ background: #1a1a1a; padding: 10px; border-radius: 4px; display: flex; justify-content: center; gap: 40px; margin-bottom: 20px; border-bottom: 2px solid #333; }}
-                .control-item {{ display: flex; align-items: center; gap: 10px; }}
-                input[type=range] {{ width: 140px; cursor: pointer; }}
-                .flex-row {{ display: flex; justify-content: space-evenly; align-items: flex-start; gap: 15px; width: 100vw; }}
-                .video-container {{ flex: 1; max-width: 48vw; }}
-                .video-feed {{ width: 100%; aspect-ratio: 16 / 9; border: 2px solid #333; border-radius: 2px; background: #000; }}
-                #wb-lbl {{ color: #00eeff; }} #exp-lbl {{ color: #ffaa00; }} #iso-lbl {{ color: #ff4444; }}
-            </style></head>
-            <body>
-                <div class="control-bar">
-                    <div class="control-item">
-                        <label id="wb-lbl">WB: <span id="wbVal">4600</span>K</label>
-                        <input type="range" min="2500" max="8000" step="100" value="4600" oninput="document.getElementById('wbVal').innerText = this.value; fetch('/set_wb?v=' + this.value);">
-                    </div>
-                    <div class="control-item">
-                        <label id="exp-lbl">EXP: <span id="expVal">{EXPOSURE_TIME_US}</span>us</label>
-                        <input type="range" min="1000" max="33000" step="500" value="{EXPOSURE_TIME_US}" oninput="document.getElementById('expVal').innerText = this.value; fetch('/set_exp?v=' + this.value);">
-                    </div>
-                    <div class="control-item">
-                        <label id="iso-lbl">ISO: <span id="isoVal">{ISO_SENSITIVITY}</span></label>
-                        <input type="range" min="100" max="1600" step="100" value="{ISO_SENSITIVITY}" oninput="document.getElementById('isoVal').innerText = this.value; fetch('/set_iso?v=' + this.value);">
-                    </div>
-                </div>
-                <div class="flex-row">
-                    <div class="video-container"><h2>Pilot HUD (Restored)</h2><img src="/hud" class="video-feed"></div>
-                    <div class="video-container"><h2>Hardware Feed (Raw)</h2><img src="/stream" class="video-feed"></div>
-                </div>
-            </body></html>'''
-            self.wfile.write(html.encode('utf-8'))
-                             
-    def log_message(self, *a): 
-        pass
-
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer): 
-    pass
+def _draw_hud_overlay(frame, telem):
+    h, w = frame.shape[:2]
+    if telem["state"] == "GOOD":   color = (0, 255, 0)      
+    elif telem["state"] == "WEAK": color = (0, 255, 255)    
+    elif telem["state"] == "BAD":  color = (0, 0, 255)      
+    else:                          color = (255, 255, 255)  
     
-threading.Thread(target=lambda: ThreadedHTTPServer(('', 8080), MJPEGHandler).serve_forever(), daemon=True).start()
+    cv2.rectangle(frame, (0, 0), (w, h), color, 6)
+    cv2.putText(frame, f"STATE: {telem['state']}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    cv2.putText(frame, f"LAPLV: {telem['blur']:.1f}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(frame, f"DEPTH: {telem['depth_pct']*100:.1f}%", (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    if recording_event.is_set():
+        cv2.putText(frame, "REC", (w - 80, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
+        cv2.circle(frame, (w - 100, 27), 8, (0, 0, 255), -1)
+    
+    cv2.drawMarker(frame, (w//2, h//2), (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
+    
+    if telem.get("message"):
+        text_size = cv2.getTextSize(telem["message"], cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
+        text_x = (w - text_size[0]) // 2
+        cv2.putText(frame, telem["message"], (text_x, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+
+def hud_encode_worker():
+    """Independent 5fps loop for rendering the HUD JPEG (frees main thread GIL)."""
+    global latest_hud_jpeg
+    while not stop_event.is_set():
+        time.sleep(0.2)  # 5fps is enough for telemetry
+        with hud_lock:
+            frame_ref = latest_preview
+            telem = hud_telemetry.copy()
+        
+        if frame_ref is not None:
+            frame = frame_ref.copy()
+            if CR_ENABLED and CR_HUD:
+                frame = fast_underwater_restore(frame, CR_R_MAX, CR_G_MAX)
+            
+            _draw_hud_overlay(frame, telem)
+            _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 55])
+            
+            # Atomic assignment without lock under GIL
+            latest_hud_jpeg = jpeg.tobytes()
+
+# ============================================================
+# ASYNC WEB SERVER (aiohttp)
+# ============================================================
+routes = web.RouteTableDef()
+
+@routes.get('/')
+async def index(request):
+    html = f'''<html><head><style>
+        body {{ background: #0b0b0b; color: #ececec; font-family: sans-serif; margin: 0; padding: 10px; text-align: center; overflow-x: hidden; }}
+        h2 {{ font-size: 1.0em; margin: 10px 0; color: #888; text-transform: uppercase; letter-spacing: 2px; }}
+        .control-bar {{ background: #1a1a1a; padding: 10px; border-radius: 4px; display: flex; justify-content: center; gap: 40px; margin-bottom: 20px; border-bottom: 2px solid #333; }}
+        .control-item {{ display: flex; align-items: center; gap: 10px; }}
+        input[type=range] {{ width: 140px; cursor: pointer; }}
+        .flex-row {{ display: flex; justify-content: space-evenly; align-items: flex-start; gap: 15px; width: 100vw; }}
+        .video-container {{ flex: 1; max-width: 48vw; }}
+        .video-feed {{ width: 100%; aspect-ratio: 16 / 9; border: 2px solid #333; border-radius: 2px; background: #000; }}
+        #wb-lbl {{ color: #00eeff; }} #exp-lbl {{ color: #ffaa00; }} #iso-lbl {{ color: #ff4444; }}
+    </style></head>
+    <body>
+        <div class="control-bar">
+            <div class="control-item">
+                <label id="wb-lbl">WB: <span id="wbVal">4600</span>K</label>
+                <input type="range" min="2500" max="8000" step="100" value="4600" oninput="document.getElementById('wbVal').innerText = this.value; fetch('/set_wb?v=' + this.value);">
+            </div>
+            <div class="control-item">
+                <label id="exp-lbl">EXP: <span id="expVal">{EXPOSURE_TIME_US}</span>us</label>
+                <input type="range" min="1000" max="33000" step="500" value="{EXPOSURE_TIME_US}" oninput="document.getElementById('expVal').innerText = this.value; fetch('/set_exp?v=' + this.value);">
+            </div>
+            <div class="control-item">
+                <label id="iso-lbl">ISO: <span id="isoVal">{ISO_SENSITIVITY}</span></label>
+                <input type="range" min="100" max="1600" step="100" value="{ISO_SENSITIVITY}" oninput="document.getElementById('isoVal').innerText = this.value; fetch('/set_iso?v=' + this.value);">
+            </div>
+        </div>
+        <div class="flex-row">
+            <div class="video-container"><h2>Pilot HUD (Restored)</h2><img src="/hud" class="video-feed"></div>
+            <div class="video-container"><h2>Hardware Feed (Raw)</h2><img src="/stream" class="video-feed"></div>
+        </div>
+    </body></html>'''
+    return web.Response(text=html, content_type='text/html')
+
+@routes.get('/set_wb')
+async def set_wb(request):
+    try:
+        val = int(request.query.get('v', 4600))
+        with cam_ctrl_lock: cam_state["wb"] = max(2500, min(8000, val))
+    except Exception: pass
+    return web.Response(text="OK")
+
+@routes.get('/set_exp')
+async def set_exp(request):
+    try:
+        val = int(request.query.get('v', 15000))
+        with cam_ctrl_lock: cam_state["exp"] = max(1000, min(33000, val))
+    except Exception: pass
+    return web.Response(text="OK")
+
+@routes.get('/set_iso')
+async def set_iso(request):
+    try:
+        val = int(request.query.get('v', 800))
+        with cam_ctrl_lock: cam_state["iso"] = max(100, min(1600, val))
+    except Exception: pass
+    return web.Response(text="OK")
+
+@routes.get('/stream')
+async def stream(request):
+    response = web.StreamResponse(headers={
+        'Cache-Control': 'no-cache,private',
+        'Content-Type': 'multipart/x-mixed-replace;boundary=FRAME'
+    })
+    await response.prepare(request)
+    try:
+        while not stop_event.is_set():
+            fd = latest_jpeg  # Lock-free atomic reference read
+            if fd:
+                await response.write(b'--FRAME\r\nContent-Type:image/jpeg\r\n')
+                await response.write(f'Content-Length:{len(fd)}\r\n\r\n'.encode())
+                await response.write(fd)
+                await response.write(b'\r\n')
+            await asyncio.sleep(0.033)  # Yield to event loop (~30fps limit)
+    except Exception:
+        pass # Handle client disconnects gracefully without crashing the loop
+    return response
+
+@routes.get('/hud')
+async def hud(request):
+    response = web.StreamResponse(headers={
+        'Cache-Control': 'no-cache,private',
+        'Content-Type': 'multipart/x-mixed-replace;boundary=FRAME'
+    })
+    await response.prepare(request)
+    try:
+        while not stop_event.is_set():
+            fd = latest_hud_jpeg  # Lock-free atomic reference read
+            if fd:
+                await response.write(b'--FRAME\r\nContent-Type:image/jpeg\r\n')
+                await response.write(f'Content-Length:{len(fd)}\r\n\r\n'.encode())
+                await response.write(fd)
+                await response.write(b'\r\n')
+            await asyncio.sleep(0.2)  # Yield to event loop (match 5fps render)
+    except Exception:
+        pass
+    return response
+
+def start_async_server():
+    """Runs the asyncio event loop in a dedicated background thread."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    app = web.Application()
+    app.add_routes(routes)
+    runner = web.AppRunner(app)
+    loop.run_until_complete(runner.setup())
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    loop.run_until_complete(site.start())
+    
+    async def watch_stop():
+        while not stop_event.is_set():
+            await asyncio.sleep(1)
+        await runner.cleanup()
+        loop.stop()
+        
+    loop.create_task(watch_stop())
+    try:
+        loop.run_forever()
+    finally:
+        loop.close()
+
+# Start the async web server in its own thread
+web_thread = threading.Thread(target=start_async_server, daemon=True)
+web_thread.start()
+
 
 # ============================================================
 # ASYNC DISK I/O WORKER
@@ -347,18 +344,19 @@ threading.Thread(target=lambda: ThreadedHTTPServer(('', 8080), MJPEGHandler).ser
 disk_queue = queue.Queue(maxsize=200)
 
 def disk_worker():
+    pin_thread(2) # Core 2 dedicated to Disk I/O
     while not stop_event.is_set() or not disk_queue.empty():
         try:
             item = disk_queue.get(timeout=0.1)
-            if item is None: 
-                break
+            if item is None: break
             filepath, img = item[0], item[1]
             
-            # Throttled Zlib Compression for PNG Depth Maps
+            # Save raw Depth maps to .u16 Binary Array (Bypasses PNG compression CPU load)
             if filepath.endswith('.png'):
-                cv2.imwrite(filepath, img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                filepath = filepath.replace('.png', '.u16')
+                img.tofile(filepath)
             else:
-                cv2.imwrite(filepath, img)
+                cv2.imwrite(filepath, img, [cv2.IMWRITE_JPEG_QUALITY, 75])
             
             disk_queue.task_done()
         except queue.Empty: 
@@ -435,7 +433,9 @@ stereo = pipeline.create(dai.node.StereoDepth)
 stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
 stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
 stereo.setLeftRightCheck(True)
-stereo.setOutputSize(ISP_WIDTH, ISP_HEIGHT)
+
+# Drop down Depth resolution directly to 640x360 to save vast USB bandwidth 
+stereo.setOutputSize(640, 360) 
 
 cfg = stereo.initialConfig.get()
 cfg.postProcessing.spatialFilter.enable = True
@@ -452,8 +452,13 @@ stereo.initialConfig.set(cfg)
 mono_l.out.link(stereo.left)
 mono_r.out.link(stereo.right)
 
+# Empower the VPU Feature Tracker to completely avoid the CPU LK fallback
 feat = pipeline.create(dai.node.FeatureTracker)
-feat.setHardwareResources(1, 1)
+feat.setHardwareResources(2, 2)  
+feat_cfg = feat.initialConfig.get()
+feat_cfg.pyramidLevels = 5       
+feat_cfg.cornerDetector.cellGridDimension = 4 
+feat.initialConfig.set(feat_cfg)
 cam.isp.link(feat.inputImage)
 
 imu_n = pipeline.create(dai.node.IMU)
@@ -541,10 +546,12 @@ with dai.Device(pipeline) as device:
     imu_t = threading.Thread(target=imu_worker, args=(device,ekf), daemon=True)
     vis_t = threading.Thread(target=visual_worker, args=(ekf,K_mat, T_ic, T_ci), daemon=True)
     lk_thread = threading.Thread(target=lk_worker, daemon=True)
+    hud_thread = threading.Thread(target=hud_encode_worker, daemon=True)
     
     imu_t.start()
     vis_t.start()
     lk_thread.start()
+    hud_thread.start()
 
     qs = device.getOutputQueue("synced", 4, False)
     qj = device.getOutputQueue("mjpeg", 2, False) 
@@ -566,7 +573,6 @@ with dai.Device(pipeline) as device:
 
     gray_curr = None
     prev_gray = None
-    fallback_pts_prev = None
 
     print(f"\n[EKF] Hold still for gravity calibration...")
 
@@ -588,8 +594,7 @@ with dai.Device(pipeline) as device:
     telemetry_stats = {
         "visual_queue_drops": 0,
         "disk_queue_drops": 0,
-        "forced_gaps_accepted": 0,
-        "cpu_fallback_engagements": 0
+        "forced_gaps_accepted": 0
     }
 
     try:
@@ -630,8 +635,8 @@ with dai.Device(pipeline) as device:
 
             mj = qj.tryGet()
             if mj:
-                with jpeg_lock: 
-                    latest_jpeg = mj.getData().tobytes()
+                # Lock-free atomic reference read from DepthAI
+                latest_jpeg = mj.getData().tobytes()
 
             mp = qp.tryGet()
             if mp:
@@ -656,10 +661,8 @@ with dai.Device(pipeline) as device:
                 dep = sy["depth"].getFrame().astype(np.uint16)
                 fm = sy["features"]
                 
-                try:
-                    rgb_ts = sy["rgb"].getTimestamp().total_seconds()
-                except AttributeError:
-                    rgb_ts = time.monotonic()
+                try: rgb_ts = sy["rgb"].getTimestamp().total_seconds()
+                except AttributeError: rgb_ts = time.monotonic()
                 
                 # Zero-Math Grayscale: Extracting the Green channel directly
                 gray_curr = raw_rgb[:, :, 1].copy()
@@ -704,8 +707,10 @@ with dai.Device(pipeline) as device:
                     quality_score = 1.0       
                     quality_state = "GOOD"
                     
-                    # Optimized Temporal Gradient (Laplacian Variance) using downsampling and float32
-                    laplacian_var = cv2.Laplacian(gray_curr[::4, ::4], cv2.CV_32F).var()
+                    # Optimized Temporal Gradient (Laplacian Variance) on center ROI to avoid downsampling aliasing
+                    h_g, w_g = gray_curr.shape
+                    roi = gray_curr[h_g//4 : 3*h_g//4, w_g//4 : 3*w_g//4]
+                    laplacian_var = cv2.Laplacian(roi, cv2.CV_32F).var()
 
                     if gap >= GATE_MAX_FRAME_GAP:
                         accept = True
@@ -807,16 +812,11 @@ with dai.Device(pipeline) as device:
                         last_saved_ekf_idx = ekf_frame_counter
                         
                         if count % 10 == 0:
-                            p = Tc[:3,3]
-                            print(f"  [{count:04d} | idx:{ekf_frame_counter}] "
-                                  f"Health: {quality_score:.2f} ({quality_state}) | {reason}")
+                            print(f"  [{count:04d} | idx:{ekf_frame_counter}] Health: {quality_score:.2f} ({quality_state}) | {reason}")
 
                 if fm and gray_curr is not None:
                     cf = {t.id:(float(t.position.x),float(t.position.y)) for t in fm.trackedFeatures}
                     ds_curr = depth_dbuf.read() if depth_dbuf else None
-                    
-                    hw_features_sent = False
-                    cpu_fallback_active = False
 
                     if prev_fd and prev_depth is not None and ekf.is_ready():
                         pp, pc = [], []
@@ -835,57 +835,9 @@ with dai.Device(pipeline) as device:
                                     pc_buffer[i, 1] = pc[i][1]
                                     
                                 visual_queue.put_nowait((pp_buffer[:n_pts].copy(), pc_buffer[:n_pts].copy(), prev_depth.copy(), prev_ts))
-                                hw_features_sent = True
-                                fallback_pts_prev = pc_buffer[:n_pts].copy().reshape(-1, 1, 2)
                             except queue.Full: 
                                 telemetry_stats["visual_queue_drops"] += 1
                                 pass
-                    
-                    if not hw_features_sent and prev_gray is not None and ekf.is_ready():
-                        cpu_fallback_active = True
-                        
-                        curr_mean = np.mean(gray_curr)
-                        intensity_ratio = 1.0
-                        if prev_mean_intensity is not None:
-                            intensity_ratio = curr_mean / max(prev_mean_intensity, 1.0)
-                            
-                            if intensity_ratio < 0.8 or intensity_ratio > 1.2:
-                                print(f"  [WARN] Illumination jump detected ({intensity_ratio:.2f}×). Skipping CPU fallback.")
-                                fallback_pts_prev = None
-                                cpu_fallback_active = False
-                                
-                        prev_mean_intensity = curr_mean
-
-                        if cpu_fallback_active:
-                            if fallback_pts_prev is not None and len(fallback_pts_prev) > 0:
-                                try:
-                                    lk_queue.put_nowait((prev_gray.copy(), gray_curr.copy(), fallback_pts_prev, prev_ts))
-                                except queue.Full:
-                                    pass  
-                                
-                                try:
-                                    good_old, good_new, async_prev_ts = lk_result_queue.get_nowait()
-                                    if len(good_new) >= MIN_FEAT_UPDATE:
-                                        try:
-                                            good_old_flat = good_old.reshape(-1, 2).copy()
-                                            good_new_flat = good_new.reshape(-1, 2).copy()
-                                            
-                                            visual_queue.put_nowait((good_old_flat, good_new_flat, prev_depth, async_prev_ts))
-                                            fallback_pts_prev = good_new.reshape(-1, 1, 2)
-                                            telemetry_stats["cpu_fallback_engagements"] += 1
-                                        except queue.Full:
-                                            telemetry_stats["visual_queue_drops"] += 1
-                                    else:
-                                        new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
-                                        fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
-                                except queue.Empty:
-                                    pass
-                            else:
-                                new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
-                                fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
-                        
-                    with hud_lock:
-                        hud_telemetry["cpu_fallback"] = cpu_fallback_active
                     
                     prev_fd = cf
                     prev_gray = gray_curr.copy()
@@ -917,6 +869,8 @@ with dai.Device(pipeline) as device:
         imu_t.join(timeout=2.0)
         vis_t.join(timeout=2.0)
         lk_thread.join(timeout=2.0)
+        hud_thread.join(timeout=2.0)
+        web_thread.join(timeout=2.0)
         disk_thread.join(timeout=30.0)
         
         if has_tty and old_settings:

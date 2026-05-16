@@ -425,17 +425,17 @@ class VIO_EKF:
             if not c_pose: continue
             
             p_c = c_pose["R"].T @ (p3d_w - c_pose["p"])
-            z, y, z_depth = p_c[0], p_c[1], p_c[2]
+            x, y, z_depth = p_c[0], p_c[1], p_c[2]
             
             if z_depth < 0.1: continue # Reject points behind camera
             
-            u_hat = K[0,0] * (z / z_depth) + K[0,2]
+            u_hat = K[0,0] * (x / z_depth) + K[0,2]
             v_hat = K[1,1] * (y / z_depth) + K[1,2]
             
             r_stack.append([u - u_hat, v - v_hat])
             
             dz_dp = np.array([
-                [1/z_depth, 0, -z/(z_depth**2)],
+                [1/z_depth, 0, -x/(z_depth**2)],
                 [0, 1/z_depth, -y/(z_depth**2)]
             ])
             Hf = dz_dp @ c_pose["R"].T

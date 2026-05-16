@@ -22,6 +22,12 @@ from utils import mem, ETA, PromiseLRU, HAS_NUMBA, _vram, _avail
 # ============================================================
 # THREAD CONTROL — before open3d internals spin up
 # ============================================================
+
+os.environ["OMP_NUM_THREADS"]      = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"]      = "1"
+os.environ["OMP_WAIT_POLICY"]      = "PASSIVE"
+
 try:
     _ncpu = len(os.sched_getaffinity(0))
 except AttributeError:
@@ -29,11 +35,6 @@ except AttributeError:
     _ncpu = multiprocessing.cpu_count()
 
 _phys = max(1, _ncpu // 2) if _ncpu <= 4 else _ncpu
-
-os.environ["OMP_NUM_THREADS"]      = str(_phys)
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"]      = str(_phys)
-os.environ["OMP_WAIT_POLICY"]      = "PASSIVE"
 
 import open3d.core as o3c
 o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
@@ -199,8 +200,13 @@ print(f"  Calibration: {cal_src} (Scaled for {DECIMATE_FACTOR}x Decimation)")
 print(f"  Scaled K: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f} ({W}x{H})")
 
 rgb_files   = sorted(glob.glob(os.path.join(RGB_DIR, "*.jpg")))
-depth_files = sorted(glob.glob(os.path.join(DEPTH_DIR, "*.png")))
-n_frames    = min(len(rgb_files), len(depth_files))
+
+# Look for our raw .u16 arrays. If they aren't there, fall back to .png
+depth_files = sorted(glob.glob(os.path.join(DEPTH_DIR, "*.u16")))
+if not depth_files:
+    depth_files = sorted(glob.glob(os.path.join(DEPTH_DIR, "*.png")))
+
+n_frames = min(len(rgb_files), len(depth_files))
 print(f"\nFrames: {n_frames}")
 if n_frames < 2: 
     raise RuntimeError("Need ≥2 frames to reconstruct.")
@@ -209,27 +215,42 @@ if n_frames < 2:
 # ZERO-COPY iGPU & CPU LOADERS (THREAD SAFE)
 # ============================================================
 ACTIVE_LOADER_MODE = "CPU"
-
 _thread_local = threading.local()
 
-# FIX: Ensure OpenCL context is thread-bound
 def get_clahe_and_context():
     """Initialize both CLAHE and ensure OpenCL context is thread-bound."""
     if not hasattr(_thread_local, "clahe"):
         if cv2.ocl.haveOpenCL():
-            # Force per-thread OpenCL context initialization
             _ = cv2.UMat(np.zeros((8, 8), dtype=np.uint8))
         _thread_local.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return _thread_local.clahe
 
+def load_depth_raw(path):
+    """Loads either raw .u16 binary files or compressed .png correctly"""
+    if path.endswith('.u16'):
+        d_1d = np.fromfile(path, dtype=np.uint16)
+        expected_w = int(cal["width"])
+        expected_h = int(cal["height"])
+
+        if len(d_1d) == expected_w * expected_h:
+            return d_1d.reshape(expected_h, expected_w)
+        else:
+            print(f"  [ERROR] .u16 depth size mismatch! Expected {expected_w*expected_h}, got {len(d_1d)}")
+            return None
+    else:
+        return cv2.imread(path, cv2.IMREAD_ANYDEPTH)
+
 def _loader_igpu(rgb_path, depth_path, quantile=0.0):
     rgb_raw = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
-    depth_raw = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
+    depth_raw = load_depth_raw(depth_path)
 
     if rgb_raw is None or depth_raw is None:
         return None, None
 
-    # Thread-local OpenCL Execution (No lock needed)
+    # Dynamically correct shape if the user modified the HW capture resolution on the stereo node
+    if depth_raw.shape[:2] != (rgb_raw.shape[0], rgb_raw.shape[1]):
+        depth_raw = cv2.resize(depth_raw, (rgb_raw.shape[1], rgb_raw.shape[0]), interpolation=cv2.INTER_NEAREST)
+
     rgb_gpu = cv2.UMat(rgb_raw)
     depth_gpu = cv2.UMat(depth_raw)
 
@@ -262,10 +283,14 @@ def _loader_igpu(rgb_path, depth_path, quantile=0.0):
 
 def _loader_cpu(rgb_path, depth_path, quantile=0.0):
     rgb_raw = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
-    depth_raw = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
+    depth_raw = load_depth_raw(depth_path)
 
     if rgb_raw is None or depth_raw is None:
         return None, None
+
+    # Dynamically correct shape if the user modified the HW capture resolution on the stereo node
+    if depth_raw.shape[:2] != (rgb_raw.shape[0], rgb_raw.shape[1]):
+        depth_raw = cv2.resize(depth_raw, (rgb_raw.shape[1], rgb_raw.shape[0]), interpolation=cv2.INTER_NEAREST)
 
     lab = cv2.cvtColor(rgb_raw, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
@@ -299,11 +324,8 @@ def load_and_decimate(rgb_path, depth_path, quantile=0.0):
     return _loader_cpu(rgb_path, depth_path, quantile)
 
 def apply_depth_uncertainty(depth_np, max_depth_m=3.0):
-    """Scale truncation distance based on depth uncertainty."""
     depth_m = depth_np.astype(np.float32) / DEPTH_SCALE
     sigma = 0.005 + 0.02 * depth_m
-    
-    # Reject outliers using both max_depth and high sigma variance
     valid_mask = (depth_m > 0) & (depth_m < max_depth_m) & (sigma < 0.05)
     adjusted = depth_np.copy()
     adjusted[~valid_mask] = 0
