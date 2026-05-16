@@ -106,6 +106,10 @@ if ENABLE_INTEL_IGPU:
         print("[HW] OpenCL Active: Hardware acceleration enabled.")
     else:
         print("[HW] OpenCL not available, falling back to CPU.")
+else:
+    cv2.ocl.setUseOpenCL(False)
+
+OPENCL_AVAILABLE = ENABLE_INTEL_IGPU and cv2.ocl.haveOpenCL()
 
 DEPTH_TRUNC_DEFAULT = 3.0
 DEPTH_TRUNC_PADDING = 0.3
@@ -126,6 +130,8 @@ GPU_DEVICE = o3c.Device("CUDA:0") if HAS_CUDA else o3c.Device("CPU:0")
 VOXEL_TSDF = VOXEL_TSDF_BASE if HAS_CUDA else max(0.015, VOXEL_TSDF_BASE)
 SDF_TRUNC = VOXEL_TSDF * 4.0
 TSDF_MODE = "TENSOR" if HAS_CUDA else "LEGACY"
+TSDF_GC_INTERVAL = 60
+TSDF_VRAM_LOG_INTERVAL = 120
 
 # ICP Cascade & Trust Weights
 ICP_TRACK_SCALES = [2.5, 1.5, 1.0]
@@ -180,6 +186,9 @@ print(f"╚═══════════════════════
 with open(os.path.join(SCAN_DIR, "intrinsics.json")) as f:
     cal = json.load(f)
 
+RAW_W = int(cal["width"])
+RAW_H = int(cal["height"])
+
 W = int(cal["width"]) // DECIMATE_FACTOR
 H = int(cal["height"]) // DECIMATE_FACTOR
 fx = float(cal["fx"]) / DECIMATE_FACTOR
@@ -229,13 +238,11 @@ def load_depth_raw(path):
     """Loads either raw .u16 binary files or compressed .png correctly"""
     if path.endswith('.u16'):
         d_1d = np.fromfile(path, dtype=np.uint16)
-        expected_w = int(cal["width"])
-        expected_h = int(cal["height"])
-
-        if len(d_1d) == expected_w * expected_h:
-            return d_1d.reshape(expected_h, expected_w)
+        expected_size = RAW_W * RAW_H
+        if len(d_1d) == expected_size:
+            return d_1d.reshape(RAW_H, RAW_W)
         else:
-            print(f"  [ERROR] .u16 depth size mismatch! Expected {expected_w*expected_h}, got {len(d_1d)}")
+            print(f"  [ERROR] .u16 depth size mismatch! Expected {expected_size}, got {len(d_1d)}")
             return None
     else:
         return cv2.imread(path, cv2.IMREAD_ANYDEPTH)
@@ -341,7 +348,7 @@ all_maxes = []
 cpu_times = []
 igpu_times = []
 
-if cv2.ocl.haveOpenCL():
+if OPENCL_AVAILABLE:
     _loader_igpu(rgb_files[0], depth_files[0], 0.0)
 
 for si in sample_indices:
@@ -352,8 +359,7 @@ for si in sample_indices:
     _loader_cpu(rgb_path, depth_path, 0.0)
     cpu_times.append(time.perf_counter() - t0)
 
-    has_opencl = cv2.ocl.haveOpenCL()
-    if has_opencl:
+    if OPENCL_AVAILABLE:
         t0 = time.perf_counter()
         d_img_tuple = _loader_igpu(rgb_path, depth_path, DEPTH_QUANTILE)
         igpu_times.append(time.perf_counter() - t0)
@@ -371,12 +377,12 @@ for si in sample_indices:
 avg_cpu_ms = (sum(cpu_times) / len(cpu_times)) * 1000 if cpu_times else 9999.0
 avg_igpu_ms = (sum(igpu_times) / len(igpu_times)) * 1000 if igpu_times else 9999.0
 
-if cv2.ocl.haveOpenCL() and avg_igpu_ms < avg_cpu_ms:
+if OPENCL_AVAILABLE and avg_igpu_ms < avg_cpu_ms:
     ACTIVE_LOADER_MODE = "IGPU"
     print(f"  [WINNER] iGPU (OpenCL) selected! ({avg_igpu_ms:.1f}ms vs CPU {avg_cpu_ms:.1f}ms per frame)")
 else:
     ACTIVE_LOADER_MODE = "CPU"
-    if cv2.ocl.haveOpenCL():
+    if OPENCL_AVAILABLE:
         print(f"  [WINNER] CPU selected! Native instructions were faster ({avg_cpu_ms:.1f}ms vs iGPU {avg_igpu_ms:.1f}ms)")
     else:
         print(f"  [WINNER] CPU selected! (OpenCL drivers not available. {avg_cpu_ms:.1f}ms per frame)")
@@ -584,7 +590,8 @@ def compute_cloud_and_fpfh(index):
     if r is None: 
         return None
     f = extract_fpfh(r, VOXEL_LOOP)
-    return (r, f)
+    dist = compute_cloud_distinctiveness(r)
+    return (r, f, dist)
 
 def get_loop_cloud_and_fpfh(index, cache):
     return cache.get_or_compute(index, compute_cloud_and_fpfh)
@@ -871,16 +878,14 @@ lc = PromiseLRU(60)
 positions_p1 = np.array([n.pose[:3, 3] for n in graph.nodes])
 candidate_indices = np.arange(0, n_frames, LOOP_CLOSURE_INTERVAL)
 
-def eval_candidate(i, ti, sd, sd_fpfh, dyn_dist):
+def eval_candidate(i, ti, sd, sd_fpfh, sd_dist, dyn_dist):
     td_data = get_loop_cloud_and_fpfh(ti, lc)
     if td_data is None: 
         return None
         
-    td, td_fpfh = td_data
+    td, td_fpfh, td_dist = td_data
     
-    dist_s = compute_cloud_distinctiveness(sd)
-    dist_t = compute_cloud_distinctiveness(td)
-    if dist_s < APERTURE_DISTINCTIVENESS_THR or dist_t < APERTURE_DISTINCTIVENESS_THR:
+    if sd_dist < APERTURE_DISTINCTIVENESS_THR or td_dist < APERTURE_DISTINCTIVENESS_THR:
         return None
     
     try:
@@ -937,7 +942,7 @@ with ThreadPoolExecutor(max_workers=_phys) as pool:
         if sd_data is None: 
             continue
             
-        sd, sd_fpfh = sd_data
+        sd, sd_fpfh, sd_dist = sd_data
         
         futures = []
         for ti in reversed(valid_ti):
@@ -948,7 +953,7 @@ with ThreadPoolExecutor(max_workers=_phys) as pool:
             ))
             dynamic_loop_dist = ICP_DIST_LOOP + drift_est
             
-            fut = pool.submit(eval_candidate, i, ti, sd, sd_fpfh, dynamic_loop_dist)
+            fut = pool.submit(eval_candidate, i, ti, sd, sd_fpfh, sd_dist, dynamic_loop_dist)
             futures.append(fut)
             
         for fut in as_completed(futures):
@@ -1164,11 +1169,11 @@ if HAS_CUDA:
             
             del dt, ct, et, fb
 
-        if eta4.i % 10 == 0:
+        if eta4.i % TSDF_GC_INTERVAL == 0:
             gc.collect()
             o3c.cuda.release_cache()
 
-        if eta4.i % 60 == 0:
+        if eta4.i % TSDF_VRAM_LOG_INTERVAL == 0:
             v = _vram()
             if v: 
                 print(f"    [{v}]")
@@ -1210,7 +1215,7 @@ else:
             vol.integrate(rgbd, intr_leg, inv_ext[i])
             del rgbd, color, depth
 
-        if eta4.i % 10 == 0:
+        if eta4.i % TSDF_GC_INTERVAL == 0:
             gc.collect()
 
         if eta4.i % 60 == 0 and _avail() < 2.0:

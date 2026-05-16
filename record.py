@@ -26,6 +26,7 @@ SAVE_DIR   = CFG["paths"]["scan_dir"]
 RGB_DIR    = os.path.join(SAVE_DIR, "rgb")
 DEPTH_DIR  = os.path.join(SAVE_DIR, "depth")
 POSES_FILE = os.path.join(SAVE_DIR, "poses.json")
+LAYOUT_FILE = os.path.join(SAVE_DIR, "hud_layout.json")
 os.makedirs(RGB_DIR, exist_ok=True)
 os.makedirs(DEPTH_DIR, exist_ok=True)
 
@@ -42,6 +43,11 @@ GATE_MIN_FRAME_GAP   = CFG["keyframe_gating"]["min_frame_gap"]
 GATE_MAX_FRAME_GAP   = CFG["keyframe_gating"]["max_frame_gap"]
 GATE_MIN_DEPTH_VALID = CFG["keyframe_gating"]["min_depth_valid_ratio"]
 GATE_MAX_BLUR_PIXELS = CFG["keyframe_gating"]["max_blur_pixels"]
+LAPLACIAN_PASS_THRESHOLD = 50.0
+
+QC_CFG = CFG.get("quality_control", {})
+TARGET_SCORE_GOOD = QC_CFG.get("score_good_threshold", 0.75)
+TARGET_DEPTH_PCT = QC_CFG.get("ideal_depth_ratio", 0.40) * 100.0
 
 STATIC_VAR_THR   = CFG["ekf_tuning"]["static_variance_threshold"]
 MIN_GRAV_SAMPLES = CFG["ekf_tuning"]["min_gravity_samples"]
@@ -77,7 +83,6 @@ cam_state = {
     "iso": ISO_SENSITIVITY
 }
 
-latest_preview = None
 hud_telemetry = {
     "state": "IDLE",
     "score": 1.0,
@@ -87,8 +92,6 @@ hud_telemetry = {
 }
 hud_lock = threading.Lock()
 runtime_state = {"bad_streak_counter": 0} 
-
-latest_hud_jpeg = None
 
 # ============================================================
 # ZERO-COPY BUFFERS
@@ -163,49 +166,6 @@ def lk_worker():
         except queue.Empty:
             continue
 
-def _draw_hud_overlay(frame, telem):
-    h, w = frame.shape[:2]
-    if telem["state"] == "GOOD":   color = (0, 255, 0)      
-    elif telem["state"] == "WEAK": color = (0, 255, 255)    
-    elif telem["state"] == "BAD":  color = (0, 0, 255)      
-    else:                          color = (255, 255, 255)  
-    
-    cv2.rectangle(frame, (0, 0), (w, h), color, 6)
-    cv2.putText(frame, f"STATE: {telem['state']}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-    cv2.putText(frame, f"LAPLV: {telem['blur']:.1f}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(frame, f"DEPTH: {telem['depth_pct']*100:.1f}%", (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    
-    if recording_event.is_set():
-        cv2.putText(frame, "REC", (w - 80, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
-        cv2.circle(frame, (w - 100, 27), 8, (0, 0, 255), -1)
-    
-    cv2.drawMarker(frame, (w//2, h//2), (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
-    
-    if telem.get("message"):
-        text_size = cv2.getTextSize(telem["message"], cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
-        text_x = (w - text_size[0]) // 2
-        cv2.putText(frame, telem["message"], (text_x, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-
-def hud_encode_worker():
-    """Independent 5fps loop for rendering the HUD JPEG (frees main thread GIL)."""
-    global latest_hud_jpeg
-    while not stop_event.is_set():
-        time.sleep(0.2)  # 5fps is enough for telemetry
-        with hud_lock:
-            frame_ref = latest_preview
-            telem = hud_telemetry.copy()
-        
-        if frame_ref is not None:
-            frame = frame_ref.copy()
-            if CR_ENABLED and CR_HUD:
-                frame = fast_underwater_restore(frame, CR_R_MAX, CR_G_MAX)
-            
-            _draw_hud_overlay(frame, telem)
-            _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 55])
-            
-            # Atomic assignment without lock under GIL
-            latest_hud_jpeg = jpeg.tobytes()
-
 # ============================================================
 # ASYNC WEB SERVER (aiohttp)
 # ============================================================
@@ -214,35 +174,638 @@ routes = web.RouteTableDef()
 @routes.get('/')
 async def index(request):
     html = f'''<html><head><style>
-        body {{ background: #0b0b0b; color: #ececec; font-family: sans-serif; margin: 0; padding: 10px; text-align: center; overflow-x: hidden; }}
-        h2 {{ font-size: 1.0em; margin: 10px 0; color: #888; text-transform: uppercase; letter-spacing: 2px; }}
-        .control-bar {{ background: #1a1a1a; padding: 10px; border-radius: 4px; display: flex; justify-content: center; gap: 40px; margin-bottom: 20px; border-bottom: 2px solid #333; }}
-        .control-item {{ display: flex; align-items: center; gap: 10px; }}
-        input[type=range] {{ width: 140px; cursor: pointer; }}
-        .flex-row {{ display: flex; justify-content: space-evenly; align-items: flex-start; gap: 15px; width: 100vw; }}
-        .video-container {{ flex: 1; max-width: 48vw; }}
-        .video-feed {{ width: 100%; aspect-ratio: 16 / 9; border: 2px solid #333; border-radius: 2px; background: #000; }}
+        :root {{
+            --panel: rgba(20, 24, 30, 0.68);
+            --panel-strong: rgba(16, 20, 26, 0.88);
+            --panel-border: rgba(136, 164, 200, 0.24);
+            --bg: #080b12;
+            --text: #e6edf7;
+            --muted: #92a6c3;
+            --accent: #3b82f6;
+            --accent-2: #22d3ee;
+        }}
+        body {{
+            background:
+                radial-gradient(1200px 700px at 10% -15%, rgba(59, 130, 246, 0.22), transparent 55%),
+                radial-gradient(900px 600px at 100% 0%, rgba(34, 211, 238, 0.17), transparent 50%),
+                var(--bg);
+            color: var(--text);
+            font-family: Inter, Segoe UI, Roboto, sans-serif;
+            margin: 0;
+            padding: 14px;
+            text-align: center;
+            overflow: hidden;
+        }}
+        h2 {{
+            font-size: 0.86em;
+            margin: 6px 0 12px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            font-weight: 700;
+        }}
+        .panel-title {{
+            font-size: 0.74em;
+            margin: 0 0 10px;
+            color: #b6c5dc;
+            text-transform: uppercase;
+            letter-spacing: 1.6px;
+            font-weight: 700;
+            text-align: left;
+        }}
+        .app {{ max-width: 1440px; margin: 0 auto; position: relative; }}
+        .control-bar {{
+            background: var(--panel-strong);
+            padding: 12px 14px;
+            border-radius: 14px;
+            display: flex;
+            justify-content: center;
+            gap: 24px;
+            margin-bottom: 12px;
+            border: 1px solid var(--panel-border);
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.32);
+        }}
+        .control-item {{ display: flex; align-items: center; gap: 8px; font-size: 13px; }}
+        input[type=range] {{ width: 140px; cursor: pointer; accent-color: var(--accent); }}
+        .flex-row {{ display: flex; justify-content: center; align-items: flex-start; width: 100%; }}
+        .video-container {{
+            flex: 1;
+            max-width: 100%;
+            background: var(--panel);
+            border: 1px solid var(--panel-border);
+            border-radius: 14px;
+            padding: 10px;
+            overflow: auto;
+            min-width: 760px;
+            min-height: 440px;
+            box-shadow: 0 14px 32px rgba(0, 0, 0, 0.32);
+        }}
+        .video-feed {{ width: 100%; aspect-ratio: 16 / 9; border: 1px solid rgba(166, 190, 223, 0.28); border-radius: 10px; background: #000; }}
+        .frame-panel {{
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            min-width: 320px;
+            min-height: 180px;
+            border: 1px solid rgba(166, 190, 223, 0.28);
+            border-radius: 10px;
+            overflow: hidden;
+            background: #000;
+        }}
+        .video-canvas {{ width: 100%; height: 100%; border: 0; border-radius: 10px; background: #000; display: block; }}
+        #hud-source {{ display: none; }}
+        .hud-layout {{ display: flex; gap: 10px; align-items: stretch; }}
+        .hud-main {{ flex: 1; min-width: 0; overflow: auto; min-width: 520px; min-height: 300px; }}
+        .side-stack {{ width: 320px; min-width: 260px; display: flex; flex-direction: column; gap: 10px; }}
+        .side-controls {{ margin-bottom: 0; display: block; }}
+        .side-controls .control-item {{ justify-content: space-between; margin-bottom: 8px; }}
+        .side-controls .control-item:last-child {{ margin-bottom: 0; }}
+        .side-controls input[type=range] {{ width: 145px; }}
+        .telemetry-panel {{
+            width: 300px;
+            padding: 10px 12px;
+            background: linear-gradient(180deg, rgba(18, 24, 34, 0.9), rgba(13, 18, 26, 0.95));
+            border: 1px solid rgba(127, 154, 190, 0.28);
+            border-radius: 12px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 14px;
+            text-align: left;
+            color: #d6e1f0;
+            line-height: 1.7;
+            white-space: pre-line;
+            overflow: auto;
+            min-width: 230px;
+            min-height: 160px;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+        }}
+        .interactive-panel {{ position: relative; touch-action: none; user-select: none; }}
+        .interactive-panel .drag-handle {{ position: absolute; top: 0; left: 0; right: 0; height: 16px; cursor: grab; opacity: 0; }}
+        .interactive-panel.active .drag-handle {{ cursor: grabbing; }}
+        .interactive-panel.active {{ z-index: 40; }}
+        @media (max-width: 1100px) {{
+            .hud-layout {{ flex-direction: column; }}
+            .side-stack {{ width: auto; }}
+            .telemetry-panel {{ width: auto; }}
+        }}
+        .toggle-btn {{
+            background: linear-gradient(180deg, rgba(59, 130, 246, 0.95), rgba(37, 99, 235, 0.95));
+            color: #fff;
+            border: 1px solid rgba(99, 179, 255, 0.7);
+            border-radius: 9px;
+            padding: 6px 11px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            box-shadow: 0 8px 18px rgba(25, 74, 150, 0.32);
+            transition: transform 120ms ease, filter 120ms ease;
+        }}
+        .toggle-btn:hover {{ filter: brightness(1.07); transform: translateY(-1px); }}
+        .toggle-btn.off {{
+            background: linear-gradient(180deg, rgba(71, 85, 105, 0.9), rgba(51, 65, 85, 0.9));
+            border-color: rgba(148, 163, 184, 0.55);
+            box-shadow: none;
+        }}
         #wb-lbl {{ color: #00eeff; }} #exp-lbl {{ color: #ffaa00; }} #iso-lbl {{ color: #ff4444; }}
     </style></head>
     <body>
-        <div class="control-bar">
-            <div class="control-item">
-                <label id="wb-lbl">WB: <span id="wbVal">4600</span>K</label>
-                <input type="range" min="2500" max="8000" step="100" value="4600" oninput="document.getElementById('wbVal').innerText = this.value; fetch('/set_wb?v=' + this.value);">
-            </div>
-            <div class="control-item">
-                <label id="exp-lbl">EXP: <span id="expVal">{EXPOSURE_TIME_US}</span>us</label>
-                <input type="range" min="1000" max="33000" step="500" value="{EXPOSURE_TIME_US}" oninput="document.getElementById('expVal').innerText = this.value; fetch('/set_exp?v=' + this.value);">
-            </div>
-            <div class="control-item">
-                <label id="iso-lbl">ISO: <span id="isoVal">{ISO_SENSITIVITY}</span></label>
-                <input type="range" min="100" max="1600" step="100" value="{ISO_SENSITIVITY}" oninput="document.getElementById('isoVal').innerText = this.value; fetch('/set_iso?v=' + this.value);">
-            </div>
-        </div>
+        <div class="app">
         <div class="flex-row">
-            <div class="video-container"><h2>Pilot HUD (Restored)</h2><img src="/hud" class="video-feed"></div>
-            <div class="video-container"><h2>Hardware Feed (Raw)</h2><img src="/stream" class="video-feed"></div>
+            <div id="video-panel" class="video-container interactive-panel" data-min-w="760" data-min-h="440">
+                <div class="drag-handle"></div>
+                <h2>Pilot HUD (Client Rendered)</h2>
+                <div class="hud-layout">
+                    <div id="hud-main-panel" class="hud-main interactive-panel" data-min-w="520" data-min-h="300">
+                        <div class="drag-handle"></div>
+                        <div id="frame-panel" class="frame-panel interactive-panel" data-min-w="320" data-min-h="180">
+                            <div class="drag-handle"></div>
+                            <canvas id="hud-canvas" class="video-canvas" width="640" height="360"></canvas>
+                        </div>
+                        <img id="hud-source" src="/stream">
+                    </div>
+                    <div class="side-stack">
+                        <div id="control-panel" class="control-bar side-controls interactive-panel" data-min-w="250" data-min-h="190">
+                            <div class="drag-handle"></div>
+                            <div class="panel-title">Camera Controls</div>
+                            <div class="control-item">
+                                <label id="wb-lbl">WB: <span id="wbVal">4600</span>K</label>
+                                <input type="range" min="2500" max="8000" step="100" value="4600" oninput="document.getElementById('wbVal').innerText = this.value; fetch('/set_wb?v=' + this.value);">
+                            </div>
+                            <div class="control-item">
+                                <label id="exp-lbl">EXP: <span id="expVal">{EXPOSURE_TIME_US}</span>us</label>
+                                <input type="range" min="1000" max="33000" step="500" value="{EXPOSURE_TIME_US}" oninput="document.getElementById('expVal').innerText = this.value; fetch('/set_exp?v=' + this.value);">
+                            </div>
+                            <div class="control-item">
+                                <label id="iso-lbl">ISO: <span id="isoVal">{ISO_SENSITIVITY}</span></label>
+                                <input type="range" min="100" max="1600" step="100" value="{ISO_SENSITIVITY}" oninput="document.getElementById('isoVal').innerText = this.value; fetch('/set_iso?v=' + this.value);">
+                            </div>
+                            <div class="control-item">
+                                <button id="annotations-toggle" class="toggle-btn" type="button">Annotations: ON</button>
+                            </div>
+                            <div class="control-item">
+                                <button id="reset-layout-btn" class="toggle-btn" type="button">Reset Layout</button>
+                            </div>
+                        </div>
+                        <div class="telemetry-panel interactive-panel" id="telemetry-panel" data-min-w="230" data-min-h="160">
+                            <div class="drag-handle"></div>
+                            <div class="panel-title">Mission Telemetry</div>
+                            STATE: IDLE (target: GOOD)
+SCORE: 1.00 (target: above {TARGET_SCORE_GOOD:.2f})
+BLUR(LAPLV): 0.0 (target: above {LAPLACIAN_PASS_THRESHOLD:.1f})
+DEPTH: 0.0% (target: above {TARGET_DEPTH_PCT:.1f}%)
+REC: NO (target: YES while recording)
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
+        </div>
+        <script>
+            const hudCanvas = document.getElementById('hud-canvas');
+            const hudCtx = hudCanvas.getContext('2d');
+            const hudSrc = document.getElementById('hud-source');
+            const telemetryPanel = document.getElementById('telemetry-panel');
+            const annotationsToggle = document.getElementById('annotations-toggle');
+            const resetLayoutBtn = document.getElementById('reset-layout-btn');
+            const LAYOUT_STORAGE_KEY = "slam_hud_layout_v1";
+            const SERVER_LAYOUT_ENDPOINT = "/layout";
+            let zCounter = 20;
+            let annotationsEnabled = true;
+            const defaultPanelState = new Map();
+            let telem = {{
+                state: "IDLE",
+                score: 1.0,
+                blur: 0.0,
+                depth_pct: 0.0,
+                message: "AWAITING GRAVITY CALIBRATION",
+                recording: false
+            }};
+
+            function syncAnnotationsToggleUI() {{
+                annotationsToggle.textContent = "Annotations: " + (annotationsEnabled ? "ON" : "OFF");
+                annotationsToggle.className = annotationsEnabled ? "toggle-btn" : "toggle-btn off";
+            }}
+
+            function resizeCursor(dir) {{
+                const map = {{
+                    "n": "ns-resize", "s": "ns-resize", "e": "ew-resize", "w": "ew-resize",
+                    "ne": "nesw-resize", "sw": "nesw-resize", "nw": "nwse-resize", "se": "nwse-resize"
+                }};
+                return map[dir] || "default";
+            }}
+
+            function getResizeDir(e, el) {{
+                const r = el.getBoundingClientRect();
+                const pad = 8;
+                const nearLeft = (e.clientX - r.left) <= pad;
+                const nearRight = (r.right - e.clientX) <= pad;
+                const nearTop = (e.clientY - r.top) <= pad;
+                const nearBottom = (r.bottom - e.clientY) <= pad;
+                let dir = "";
+                if (nearTop) dir += "n";
+                else if (nearBottom) dir += "s";
+                if (nearLeft) dir += "w";
+                else if (nearRight) dir += "e";
+                return dir;
+            }}
+
+            function isInteractiveTarget(target) {{
+                return !!target.closest("input, button, label, canvas");
+            }}
+
+            function getTranslate(el) {{
+                const m = /translate\\(([-\\d.]+)px,\\s*([-\\d.]+)px\\)/.exec(el.style.transform || "");
+                return {{
+                    x: m ? Number(m[1]) : 0,
+                    y: m ? Number(m[2]) : 0
+                }};
+            }}
+
+            function setTranslate(el, x, y) {{
+                el.style.transform = "translate(" + Math.round(x) + "px, " + Math.round(y) + "px)";
+            }}
+
+            function rectInParent(el, parentRect) {{
+                const r = el.getBoundingClientRect();
+                return {{
+                    left: r.left - parentRect.left,
+                    top: r.top - parentRect.top,
+                    right: r.right - parentRect.left,
+                    bottom: r.bottom - parentRect.top,
+                    width: r.width,
+                    height: r.height
+                }};
+            }}
+
+            function overlaps(a, b, gap = 6) {{
+                return !(a.right <= b.left + gap || a.left >= b.right - gap || a.bottom <= b.top + gap || a.top >= b.bottom - gap);
+            }}
+
+            function clampTranslateToParent(el, tx, ty) {{
+                const parent = el.parentElement;
+                if (!parent) return {{ x: tx, y: ty }};
+                const parentRect = parent.getBoundingClientRect();
+                const r = el.getBoundingClientRect();
+                const w = r.width;
+                const h = r.height;
+                const base = getTranslate(el);
+                const currentLeft = r.left - parentRect.left;
+                const currentTop = r.top - parentRect.top;
+                const proposedLeft = currentLeft + (tx - base.x);
+                const proposedTop = currentTop + (ty - base.y);
+                const pad = 2;
+                const maxLeft = Math.max(pad, parentRect.width - w - pad);
+                const maxTop = Math.max(pad, parentRect.height - h - pad);
+                const clampedLeft = Math.min(maxLeft, Math.max(pad, proposedLeft));
+                const clampedTop = Math.min(maxTop, Math.max(pad, proposedTop));
+                return {{
+                    x: tx + (clampedLeft - proposedLeft),
+                    y: ty + (clampedTop - proposedTop)
+                }};
+            }}
+
+            function movePanelAway(mover, blocker, parentRect) {{
+                const mRect = rectInParent(mover, parentRect);
+                const bRect = rectInParent(blocker, parentRect);
+                if (!overlaps(mRect, bRect)) return false;
+
+                const t = getTranslate(mover);
+                const gap = 8;
+                const options = [
+                    {{ dx: (bRect.right + gap) - mRect.left, dy: 0 }},
+                    {{ dx: (bRect.left - gap) - mRect.right, dy: 0 }},
+                    {{ dx: 0, dy: (bRect.bottom + gap) - mRect.top }},
+                    {{ dx: 0, dy: (bRect.top - gap) - mRect.bottom }}
+                ];
+
+                let best = null;
+                for (const opt of options) {{
+                    const candidate = clampTranslateToParent(mover, t.x + opt.dx, t.y + opt.dy);
+                    const cost = Math.abs(candidate.x - t.x) + Math.abs(candidate.y - t.y);
+                    if (!best || cost < best.cost) best = {{ ...candidate, cost }};
+                }}
+
+                if (!best) return false;
+                setTranslate(mover, best.x, best.y);
+                return true;
+            }}
+
+            function resolveCollisions(parent, anchorEl) {{
+                if (!parent) return;
+                const panels = Array.from(parent.children).filter((c) => c.classList && c.classList.contains("interactive-panel"));
+                if (!panels.includes(anchorEl)) return;
+                const ordered = [anchorEl, ...panels.filter((p) => p !== anchorEl)];
+                const parentRect = parent.getBoundingClientRect();
+
+                for (let iter = 0; iter < 24; iter++) {{
+                    let changed = false;
+                    for (let i = 0; i < ordered.length; i++) {{
+                        const blocker = ordered[i];
+                        for (let j = 0; j < ordered.length; j++) {{
+                            if (i === j) continue;
+                            const mover = ordered[j];
+                            if (movePanelAway(mover, blocker, parentRect)) {{
+                                changed = true;
+                                const minW = Number(mover.dataset.minW || 160);
+                                const minH = Number(mover.dataset.minH || 120);
+                                clampPanelToParent(mover, minW, minH);
+                            }}
+                        }}
+                    }}
+                    if (!changed) break;
+                }}
+            }}
+
+            function clampPanelToParent(el, minW, minH) {{
+                const parent = el.parentElement;
+                if (!parent) return;
+
+                const parentRect = parent.getBoundingClientRect();
+                const maxW = Math.max(minW, parentRect.width - 6);
+                const maxH = Math.max(minH, parentRect.height - 6);
+
+                const currentW = el.getBoundingClientRect().width;
+                const currentH = el.getBoundingClientRect().height;
+                const clampedW = Math.min(Math.max(minW, currentW), maxW);
+                const clampedH = Math.min(Math.max(minH, currentH), maxH);
+                el.style.width = clampedW + "px";
+                el.style.height = clampedH + "px";
+
+                const txMatch = /translate\\(([-\\d.]+)px,\\s*([-\\d.]+)px\\)/.exec(el.style.transform || "");
+                let tx = txMatch ? Number(txMatch[1]) : 0;
+                let ty = txMatch ? Number(txMatch[2]) : 0;
+
+                let rect = el.getBoundingClientRect();
+                const pad = 2;
+                if (rect.left < parentRect.left + pad) tx += (parentRect.left + pad - rect.left);
+                if (rect.right > parentRect.right - pad) tx -= (rect.right - (parentRect.right - pad));
+                if (rect.top < parentRect.top + pad) ty += (parentRect.top + pad - rect.top);
+                if (rect.bottom > parentRect.bottom - pad) ty -= (rect.bottom - (parentRect.bottom - pad));
+                setTranslate(el, tx, ty);
+            }}
+
+            function applyLayoutState(layout) {{
+                Object.entries(layout).forEach(([id, state]) => {{
+                    const el = document.getElementById(id);
+                    if (!el) return;
+                    if (typeof state.width === "string" && state.width) el.style.width = state.width;
+                    if (typeof state.height === "string" && state.height) el.style.height = state.height;
+                    if (typeof state.transform === "string" && state.transform) el.style.transform = state.transform;
+                    const minW = Number(el.dataset.minW || 160);
+                    const minH = Number(el.dataset.minH || 120);
+                    clampPanelToParent(el, minW, minH);
+                }});
+            }}
+
+            function saveLayoutState() {{
+                try {{
+                    const layout = {{}};
+                    document.querySelectorAll(".interactive-panel[id]").forEach((el) => {{
+                        layout[el.id] = {{
+                            width: el.style.width || "",
+                            height: el.style.height || "",
+                            transform: el.style.transform || "translate(0px, 0px)"
+                        }};
+                    }});
+                    const payload = JSON.stringify(layout);
+                    localStorage.setItem(LAYOUT_STORAGE_KEY, payload);
+                    fetch(SERVER_LAYOUT_ENDPOINT, {{
+                        method: "POST",
+                        headers: {{ "Content-Type": "application/json" }},
+                        body: payload,
+                        keepalive: true
+                    }}).catch(() => {{}});
+                    return payload;
+                }} catch (_) {{}}
+                return null;
+            }}
+
+            async function loadLayoutState() {{
+                let layout = null;
+                try {{
+                    const r = await fetch(SERVER_LAYOUT_ENDPOINT, {{ cache: "no-store" }});
+                    if (r.ok) {{
+                        const remote = await r.json();
+                        if (remote && typeof remote === "object" && Object.keys(remote).length > 0) {{
+                            layout = remote;
+                        }}
+                    }}
+                }} catch (_) {{}}
+                if (!layout) {{
+                    try {{
+                        const raw = localStorage.getItem(LAYOUT_STORAGE_KEY);
+                        if (raw) layout = JSON.parse(raw);
+                    }} catch (_) {{}}
+                }}
+                if (layout && typeof layout === "object") applyLayoutState(layout);
+            }}
+
+            function makePanelInteractive(el) {{
+                const rect = el.getBoundingClientRect();
+                el.style.width = rect.width + "px";
+                el.style.height = rect.height + "px";
+                if (!el.style.transform) el.style.transform = "translate(0px, 0px)";
+
+                let mode = null;
+                let dir = "";
+                let sx = 0, sy = 0;
+                let startW = 0, startH = 0;
+                let startTX = 0, startTY = 0;
+                let startRect = null;
+                let parentRect = null;
+                const minW = Number(el.dataset.minW || 160);
+                const minH = Number(el.dataset.minH || 120);
+                defaultPanelState.set(el, {{
+                    width: rect.width,
+                    height: rect.height,
+                    transform: "translate(0px, 0px)"
+                }});
+
+                const onMouseMove = (e) => {{
+                    if (mode) {{
+                        const dx = e.clientX - sx;
+                        const dy = e.clientY - sy;
+                        if (mode === "drag") {{
+                            let nextTX = startTX + dx;
+                            let nextTY = startTY + dy;
+                            const minTX = startTX + (parentRect.left + 2 - startRect.left);
+                            const maxTX = startTX + (parentRect.right - 2 - startRect.right);
+                            const minTY = startTY + (parentRect.top + 2 - startRect.top);
+                            const maxTY = startTY + (parentRect.bottom - 2 - startRect.bottom);
+                            nextTX = Math.min(maxTX, Math.max(minTX, nextTX));
+                            nextTY = Math.min(maxTY, Math.max(minTY, nextTY));
+                            setTranslate(el, nextTX, nextTY);
+                            return;
+                        }}
+
+                        let newW = startW;
+                        let newH = startH;
+                        let newTX = startTX;
+                        let newTY = startTY;
+
+                        if (dir.includes("e")) newW = Math.max(minW, startW + dx);
+                        if (dir.includes("s")) newH = Math.max(minH, startH + dy);
+                        if (dir.includes("w")) {{
+                            const w = Math.max(minW, startW - dx);
+                            newTX += (startW - w);
+                            newW = w;
+                        }}
+                        if (dir.includes("n")) {{
+                            const h = Math.max(minH, startH - dy);
+                            newTY += (startH - h);
+                            newH = h;
+                        }}
+
+                        el.style.width = newW + "px";
+                        el.style.height = newH + "px";
+                        setTranslate(el, newTX, newTY);
+                        clampPanelToParent(el, minW, minH);
+                        return;
+                    }}
+
+                    const d = getResizeDir(e, el);
+                    if (d) el.style.cursor = resizeCursor(d);
+                    else if (e.target.closest(".drag-handle")) el.style.cursor = "grab";
+                    else el.style.cursor = "default";
+                }};
+
+                const onMouseUp = () => {{
+                    if (mode && el.parentElement) {{
+                        resolveCollisions(el.parentElement, el);
+                    }}
+                    if (mode) saveLayoutState();
+                    mode = null;
+                    el.classList.remove("active");
+                }};
+
+                el.addEventListener("mousedown", (e) => {{
+                    if (e.button !== 0) return;
+                    const d = getResizeDir(e, el);
+                    const txMatch = /translate\\(([-\\d.]+)px,\\s*([-\\d.]+)px\\)/.exec(el.style.transform || "");
+                    startTX = txMatch ? Number(txMatch[1]) : 0;
+                    startTY = txMatch ? Number(txMatch[2]) : 0;
+                    sx = e.clientX;
+                    sy = e.clientY;
+                    startRect = el.getBoundingClientRect();
+                    parentRect = el.parentElement.getBoundingClientRect();
+                    startW = startRect.width;
+                    startH = startRect.height;
+                    el.style.zIndex = String(++zCounter);
+                    el.classList.add("active");
+
+                    if (d) {{
+                        mode = "resize";
+                        dir = d;
+                        e.stopPropagation();
+                        e.preventDefault();
+                        return;
+                    }}
+
+                    if (isInteractiveTarget(e.target) && !e.target.closest(".drag-handle")) return;
+                    mode = "drag";
+                    e.stopPropagation();
+                    e.preventDefault();
+                }});
+
+                window.addEventListener("mousemove", onMouseMove);
+                window.addEventListener("mouseup", onMouseUp);
+            }}
+
+            document.querySelectorAll(".interactive-panel").forEach(makePanelInteractive);
+            loadLayoutState();
+            resetLayoutBtn.addEventListener("click", () => {{
+                defaultPanelState.forEach((state, el) => {{
+                    el.style.width = state.width + "px";
+                    el.style.height = state.height + "px";
+                    el.style.transform = state.transform;
+                    const minW = Number(el.dataset.minW || 160);
+                    const minH = Number(el.dataset.minH || 120);
+                    clampPanelToParent(el, minW, minH);
+                }});
+                localStorage.removeItem(LAYOUT_STORAGE_KEY);
+                fetch(SERVER_LAYOUT_ENDPOINT, {{
+                    method: "POST",
+                    headers: {{ "Content-Type": "application/json" }},
+                    body: "{{}}",
+                    keepalive: true
+                }}).catch(() => {{}});
+            }});
+            window.addEventListener("beforeunload", saveLayoutState);
+
+            annotationsToggle.addEventListener('click', () => {{
+                annotationsEnabled = !annotationsEnabled;
+                syncAnnotationsToggleUI();
+            }});
+
+            async function pollTelemetry() {{
+                try {{
+                    const r = await fetch('/telemetry', {{ cache: 'no-store' }});
+                    if (r.ok) {{
+                        telem = await r.json();
+                        telemetryPanel.textContent = "STATE: " + telem.state + " (target: GOOD)\\n" +
+                            "SCORE: " + Number(telem.score || 0).toFixed(2) + " (target: above {TARGET_SCORE_GOOD:.2f})\\n" +
+                            "BLUR(LAPLV): " + Number(telem.blur || 0).toFixed(1) + " (target: above {LAPLACIAN_PASS_THRESHOLD:.1f})\\n" +
+                            "DEPTH: " + (Number(telem.depth_pct || 0) * 100).toFixed(1) + "%" + " (target: above {TARGET_DEPTH_PCT:.1f}%)\\n" +
+                            "REC: " + (telem.recording ? "YES" : "NO") + " (target: YES while recording)";
+                    }}
+                }} catch (_) {{}}
+                setTimeout(pollTelemetry, 200);
+            }}
+
+            function drawHud() {{
+                const cssW = Math.max(2, hudCanvas.clientWidth);
+                const cssH = Math.max(2, hudCanvas.clientHeight);
+                if (hudCanvas.width !== cssW || hudCanvas.height !== cssH) {{
+                    hudCanvas.width = cssW;
+                    hudCanvas.height = cssH;
+                }}
+
+                const w = hudCanvas.width;
+                const h = hudCanvas.height;
+
+                try {{
+                    hudCtx.drawImage(hudSrc, 0, 0, w, h);
+                }} catch (_) {{}}
+
+                if (!annotationsEnabled) {{
+                    requestAnimationFrame(drawHud);
+                    return;
+                }}
+
+                if (telem.recording) {{
+                    hudCtx.fillStyle = "rgba(0, 0, 0, 0.42)";
+                    hudCtx.fillRect(w - 124, 8, 112, 34);
+                    hudCtx.font = "bold 24px sans-serif";
+                    hudCtx.fillStyle = "#ff0000";
+                    hudCtx.beginPath();
+                    hudCtx.arc(w - 100, 27, 8, 0, Math.PI * 2);
+                    hudCtx.fill();
+                    hudCtx.fillText("REC", w - 80, 35);
+                }}
+
+                hudCtx.strokeStyle = "#ffffff";
+                hudCtx.lineWidth = 1;
+                hudCtx.beginPath();
+                hudCtx.moveTo((w / 2) - 10, h / 2);
+                hudCtx.lineTo((w / 2) + 10, h / 2);
+                hudCtx.moveTo(w / 2, (h / 2) - 10);
+                hudCtx.lineTo(w / 2, (h / 2) + 10);
+                hudCtx.stroke();
+
+                if (telem.message) {{
+                    hudCtx.fillStyle = "rgba(0, 0, 0, 0.55)";
+                    hudCtx.fillRect(0, h - 58, w, 58);
+                    hudCtx.font = "bold 28px sans-serif";
+                    hudCtx.fillStyle = "#ff0000";
+                    const textW = hudCtx.measureText(telem.message).width;
+                    hudCtx.fillText(telem.message, (w - textW) / 2, h - 30);
+                }}
+
+                requestAnimationFrame(drawHud);
+            }}
+
+            syncAnnotationsToggleUI();
+            pollTelemetry();
+            requestAnimationFrame(drawHud);
+        </script>
     </body></html>'''
     return web.Response(text=html, content_type='text/html')
 
@@ -290,25 +853,58 @@ async def stream(request):
         pass # Handle client disconnects gracefully without crashing the loop
     return response
 
-@routes.get('/hud')
-async def hud(request):
-    response = web.StreamResponse(headers={
-        'Cache-Control': 'no-cache,private',
-        'Content-Type': 'multipart/x-mixed-replace;boundary=FRAME'
-    })
-    await response.prepare(request)
+@routes.get('/telemetry')
+async def telemetry(request):
+    with hud_lock:
+        payload = hud_telemetry.copy()
+    payload["recording"] = recording_event.is_set()
+    return web.json_response(payload)
+
+@routes.get('/layout')
+async def get_layout(request):
+    if not os.path.exists(LAYOUT_FILE):
+        return web.json_response({})
     try:
-        while not stop_event.is_set():
-            fd = latest_hud_jpeg  # Lock-free atomic reference read
-            if fd:
-                await response.write(b'--FRAME\r\nContent-Type:image/jpeg\r\n')
-                await response.write(f'Content-Length:{len(fd)}\r\n\r\n'.encode())
-                await response.write(fd)
-                await response.write(b'\r\n')
-            await asyncio.sleep(0.2)  # Yield to event loop (match 5fps render)
-    except Exception:
+        with open(LAYOUT_FILE, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return web.json_response(data)
+    except (OSError, json.JSONDecodeError):
         pass
-    return response
+    return web.json_response({})
+
+@routes.post('/layout')
+async def set_layout(request):
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.Response(status=400, text="Invalid JSON")
+
+    if not isinstance(payload, dict):
+        return web.Response(status=400, text="Layout must be an object")
+
+    sanitized = {}
+    for panel_id, state in payload.items():
+        if not isinstance(panel_id, str) or not isinstance(state, dict):
+            continue
+        width = state.get("width", "")
+        height = state.get("height", "")
+        transform = state.get("transform", "translate(0px, 0px)")
+        if not isinstance(width, str) or not isinstance(height, str) or not isinstance(transform, str):
+            continue
+        sanitized[panel_id] = {
+            "width": width[:32],
+            "height": height[:32],
+            "transform": transform[:64]
+        }
+
+    try:
+        with open(LAYOUT_FILE, "w") as f:
+            json.dump(sanitized, f)
+    except OSError as e:
+        return web.Response(status=500, text=f"Failed to save layout: {e}")
+
+    return web.json_response({"ok": True})
 
 def start_async_server():
     """Runs the asyncio event loop in a dedicated background thread."""
@@ -414,12 +1010,6 @@ xout_jpeg.input.setBlocking(False)
 xout_jpeg.input.setQueueSize(2)
 jpeg_enc.bitstream.link(xout_jpeg.input)
 
-xout_prev = pipeline.create(dai.node.XLinkOut)
-xout_prev.setStreamName("preview")
-xout_prev.input.setBlocking(False)
-xout_prev.input.setQueueSize(2)
-cam.preview.link(xout_prev.input)
-
 mono_l = pipeline.create(dai.node.MonoCamera)
 mono_r = pipeline.create(dai.node.MonoCamera)
 mono_l.setBoardSocket(dai.CameraBoardSocket.CAM_B)
@@ -430,7 +1020,11 @@ mono_l.setFps(TARGET_FPS)
 mono_r.setFps(TARGET_FPS)
 
 stereo = pipeline.create(dai.node.StereoDepth)
-stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
+if hasattr(dai.node.StereoDepth.PresetMode, "DEFAULT"):
+    stereo_preset = dai.node.StereoDepth.PresetMode.DEFAULT
+else:
+    stereo_preset = dai.node.StereoDepth.PresetMode.HIGH_DENSITY
+stereo.setDefaultProfilePreset(stereo_preset)
 stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
 stereo.setLeftRightCheck(True)
 
@@ -456,8 +1050,11 @@ mono_r.out.link(stereo.right)
 feat = pipeline.create(dai.node.FeatureTracker)
 feat.setHardwareResources(2, 2)  
 feat_cfg = feat.initialConfig.get()
-feat_cfg.pyramidLevels = 5       
-feat_cfg.cornerDetector.cellGridDimension = 4 
+if hasattr(feat_cfg, "pyramidLevels"):
+    feat_cfg.pyramidLevels = 5
+
+if hasattr(feat_cfg, "cornerDetector") and hasattr(feat_cfg.cornerDetector, "cellGridDimension"):
+    feat_cfg.cornerDetector.cellGridDimension = 4
 feat.initialConfig.set(feat_cfg)
 cam.isp.link(feat.inputImage)
 
@@ -495,7 +1092,7 @@ sync.out.link(xout_s.input)
 # MAIN
 # ============================================================
 print(f"Starting VIO ({'Numba JIT' if HAS_NUMBA else 'numpy'})...")
-print(f"HUD available at http://<IP>:8080/")
+print(f"HUD available at http://<PI_IP>:8080/ (client browser renders overlay)")
 
 ekf = VIO_EKF()
 saved_poses = []
@@ -546,16 +1143,13 @@ with dai.Device(pipeline) as device:
     imu_t = threading.Thread(target=imu_worker, args=(device,ekf), daemon=True)
     vis_t = threading.Thread(target=visual_worker, args=(ekf,K_mat, T_ic, T_ci), daemon=True)
     lk_thread = threading.Thread(target=lk_worker, daemon=True)
-    hud_thread = threading.Thread(target=hud_encode_worker, daemon=True)
     
     imu_t.start()
     vis_t.start()
     lk_thread.start()
-    hud_thread.start()
 
     qs = device.getOutputQueue("synced", 4, False)
     qj = device.getOutputQueue("mjpeg", 2, False) 
-    qp = device.getOutputQueue("preview", 2, False) 
     control_q = device.getInputQueue("control")
 
     count = 0
@@ -638,15 +1232,9 @@ with dai.Device(pipeline) as device:
                 # Lock-free atomic reference read from DepthAI
                 latest_jpeg = mj.getData().tobytes()
 
-            mp = qp.tryGet()
-            if mp:
-                frame_np = mp.getCvFrame()
-                with hud_lock:
-                    latest_preview = frame_np
-
             sy = qs.tryGet()
             
-            if sy or mj or mp:
+            if sy or mj:
                 last_heartbeat = time.time()
                 
             if time.time() - last_heartbeat > 5.0:
@@ -725,7 +1313,7 @@ with dai.Device(pipeline) as device:
                         if valid_ratio < GATE_MIN_DEPTH_VALID:
                             reason = f"bad_depth({valid_ratio:.2f})"
                         else:
-                            if laplacian_var < 50.0:
+                            if laplacian_var < LAPLACIAN_PASS_THRESHOLD:
                                 reason = f"blur_laplacian({laplacian_var:.1f})"
                             else:
                                 accept = True
@@ -869,7 +1457,6 @@ with dai.Device(pipeline) as device:
         imu_t.join(timeout=2.0)
         vis_t.join(timeout=2.0)
         lk_thread.join(timeout=2.0)
-        hud_thread.join(timeout=2.0)
         web_thread.join(timeout=2.0)
         disk_thread.join(timeout=30.0)
         
