@@ -1,12 +1,12 @@
-import os
 import json
 import sys
+from pathlib import Path
 
-# Safely resolve path relative to this file
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config/config.json")
+# Safely resolve path relative to the repo's config directory
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "config.json"
 
 try:
-    with open(CONFIG_PATH, "r") as f:
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         CFG = json.load(f)
 except FileNotFoundError:
     print(f"\n[FATAL] Could not find configuration file at:\n  {CONFIG_PATH}")

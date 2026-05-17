@@ -43,7 +43,10 @@ def _run_reconstruct(repo_dir: Path, scan_dir: Path) -> int:
     env = os.environ.copy()
     env["TRITON_NONINTERACTIVE"] = "1"
     env["TRITON_SCAN_DIR"] = str(scan_dir)
-    cmd = [sys.executable, "reconstruct.py"]
+    src_path = str((repo_dir / "src").resolve())
+    existing_path = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = src_path if not existing_path else f"{src_path}{os.pathsep}{existing_path}"
+    cmd = [sys.executable, "-m", "slam", "reconstruct"]
     return subprocess.call(cmd, cwd=str(repo_dir), env=env)
 
 
@@ -116,7 +119,7 @@ def _score_one(repo_dir: Path, item: dict, run_reconstruct: bool) -> dict:
     }
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Regression harness for SLAM reconstruction benchmarks.")
     parser.add_argument(
         "--manifest",
@@ -126,11 +129,11 @@ def main() -> int:
     parser.add_argument(
         "--no-run",
         action="store_true",
-        help="Do not run reconstruct.py; only score existing metrics files.",
+        help="Do not run the reconstruction step; only score existing metrics files.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    repo_dir = Path(__file__).resolve().parent
+    repo_dir = Path(os.environ.get("TRITON_REPO_DIR", str(Path(__file__).resolve().parents[3]))).resolve()
     manifest_path = Path(args.manifest)
     if not manifest_path.is_absolute():
         manifest_path = (repo_dir / manifest_path).resolve()

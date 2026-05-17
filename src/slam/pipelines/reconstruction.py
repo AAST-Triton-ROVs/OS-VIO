@@ -16,8 +16,8 @@ import cv2
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # IMPORT OUR CUSTOM MODULES
-from load_config import CFG, DECIMATE_FACTOR, ENABLE_INTEL_IGPU, DEPTH_SCALE
-from utils import mem, ETA, PromiseLRU, HAS_NUMBA, _vram, _avail
+from ..shared.settings import CFG, DECIMATE_FACTOR, ENABLE_INTEL_IGPU, DEPTH_SCALE
+from ..shared.helpers import mem, ETA, PromiseLRU, HAS_NUMBA, _vram, _avail
 
 # ============================================================
 # THREAD CONTROL — before open3d internals spin up
@@ -184,7 +184,7 @@ APERTURE_DISTINCTIVENESS_THR  = 0.05
 APERTURE_IMU_BOOST            = 5.0
 
 print(f"╔═════════════════════════════════════════════════════════╗")
-print(f"║  reconstruct.py — Final Boss Edition                    ║")
+print(f"║  reconstruction.py — Final Boss Edition                ║")
 print(f"║  Device : {'CUDA:0 (GPU)' if HAS_CUDA else 'CPU only':44s}  ║")
 print(f"║  TSDF   : {TSDF_MODE:6s} @ {VOXEL_TSDF*1000:.0f}mm                                     ║")
 print(f"║  Colored ICP : {'ON' if USE_COLORED_ICP else 'OFF':3s}                                        ║")

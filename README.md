@@ -3,16 +3,16 @@
 
 **Visual-Inertial Odometry and Dense Reconstruction Pipeline for Subsea Environments**
 
-[![Python]([https://img.shields.io/badge/Python-3.8%2B-blue.svg](https://www.python.org/))]()
-[![Open3D]([https://img.shields.io/badge/Open3D-0.16%2B-lightgrey.svg](https://www.open3d.org/))]()
-[![DepthAI]([https://img.shields.io/badge/DepthAI-OAK--D-orange.svg](https://docs.luxonis.com/software-v3/depthai/))]()
-[![Numba]([https://img.shields.io/badge/Numba-JIT-green.svg](https://numba.pydata.org/))]()
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
+[![Open3D](https://img.shields.io/badge/Open3D-0.18%2B-lightgrey.svg)](https://www.open3d.org/)
+[![DepthAI](https://img.shields.io/badge/DepthAI-OAK--D-orange.svg)](https://docs.luxonis.com/software-v3/depthai/)
+[![Numba](https://img.shields.io/badge/Numba-JIT-green.svg)](https://numba.pydata.org/)
 
 ---
 
 ## Overview
 
-This is a Simultaneous Localization and Mapping (SLAM) system designed for underwater ROV navigation, addressing domain-specific challenges such as optical refraction, variable turbidity, and dynamic lighting. 
+This is a Simultaneous Localization and Mapping (SLAM) system designed for underwater ROV navigation, addressing domain-specific challenges such as optical refraction, variable turbidity, and dynamic lighting.
 
 The pipeline fuses high-frequency inertial data with stereo vision utilizing a 15-Degree-of-Freedom (DOF) Local Error-State Kalman Filter (ESKF) for real-time state estimation. Offline, the estimated trajectory seeds a global pose graph, followed by Truncated Signed Distance Function (TSDF) volumetric integration to generate a dense 3D mesh.
 
@@ -51,6 +51,21 @@ make install-laptop
 
 ---
 
+## Repository layout
+
+- `src/slam/shared/settings.py` — runtime settings loader
+- `src/slam/shared/helpers.py` — shared helper utilities
+- `src/slam/estimation/state_estimator.py` — state estimation and filtering
+- `src/slam/pipelines/acquisition.py` — acquisition pipeline
+- `src/slam/pipelines/reconstruction.py` — reconstruction pipeline
+- `src/slam/pipelines/benchmarking.py` — benchmark scoring pipeline
+- `src/slam/dashboard/frontend.py` — browser dashboard client
+- `src/slam/dashboard/server.py` — browser dashboard server
+- `src/slam/cli.py` — command runner for `python -m slam`
+- `requirements/` — pinned dependency sets for Pi and laptop environments
+- `benchmarks/` — benchmark manifest and scorecard output
+- `scan/` — mission data and HUD layout files
+
 ## Usage
 
 The system operates in two distinct phases: real-time data acquisition and offline reconstruction.
@@ -76,18 +91,18 @@ make reconstruct
 
 ## System Components
 
-### 1. Acquisition and Gating (`record.py`)
+### 1. Acquisition and Gating (`slam/pipelines/acquisition.py`)
 Handles data ingestion, thread management, and initial data validation.
 * **Statistical Gating:** Evaluates spatial point variance to filter unstructured feature tracking and applies the gyroscopic blur threshold.
 * **Telemetry Watchdog:** Monitors hardware bus activity. Stalls exceeding 5.0 seconds trigger a safe pipeline termination and data flush.
 
-### 2. State Estimator (`ekf.py`)
+### 2. State Estimator (`slam/estimation/state_estimator.py`)
 The primary numerical filter, with core matrix operations compiled via Numba.
 * **IMU Kinematic Clamping:** Restricts input accelerations to physical ROV limits ($\pm 25 m/s^2$) to prevent integration instability during hull impacts.
 * **Mahalanobis Gating:** Evaluates incoming visual measurements against the state covariance matrix ($\mathbf{P}$). Innovations exceeding the $\chi^2$ threshold are discarded.
 * **Covariance Management:** In prolonged periods of visual denial, the filter marginally inflates the covariance matrix to ensure receptivity to future visual updates.
 
-### 3. Reconstruction Backend (`reconstruct.py`)
+### 3. Reconstruction Backend (`slam/pipelines/reconstruction.py`)
 Handles global trajectory optimization and volumetric mapping.
 * **Color Equalization:** Optionally leverages OpenCL (`cv2.UMat`) for hardware-accelerated red-channel attenuation correction.
 * **Pose Graph Optimization:** Utilizes Multi-Scale ICP for scan matching. Applies Singular Value Decomposition (SVD) on local point cloud normals to reject geometrically degenerate (planar) loop closures.
@@ -95,9 +110,9 @@ Handles global trajectory optimization and volumetric mapping.
 
 ---
 
-## Configuration (`config.json`)
+## Configuration (`src/config/config.json`)
 
-System parameters are defined externally in `config.json`.
+System parameters are defined externally in `src/config/config.json`.
 
 ### Practical tuning guide
 

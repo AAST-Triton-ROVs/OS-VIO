@@ -2,8 +2,8 @@ import math
 import numpy as np
 import threading
 import cv2
-from utils import RunningVariance
-from load_config import CFG
+from ..shared.helpers import RunningVariance
+from ..shared.settings import CFG
 
 try:
     from numba import njit
