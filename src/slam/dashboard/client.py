@@ -37,7 +37,7 @@ body::before{{content:'';position:fixed;inset:0;background:
 .panel-body{{position:absolute;top:var(--drag-h);left:0;right:0;bottom:0;overflow:hidden}} .resize-se{{position:absolute;right:0;bottom:0;width:14px;height:14px;cursor:se-resize;z-index:10;background:linear-gradient(135deg, transparent 50%, rgba(100,160,255,.18) 50%)}}
 #panel-video{{left:12px;top:12px;width:calc(100% - 344px);height:calc(100% - 24px);min-width:400px;min-height:280px}}
 .video-wrap{{width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#000}}
-#hud-canvas{{width:100%;height:100%;display:block;object-fit:contain}} #hud-source{{display:none}}
+#hud-canvas{{width:100%;height:100%;display:block;object-fit:contain}} #hud-source{{position:absolute;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none}}
 #rec-badge{{position:absolute;top:calc(var(--drag-h) + 10px);right:12px;display:none;background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.5);border-radius:6px;padding:4px 10px;font-size:11px;font-weight:500;letter-spacing:2px;color:var(--red);align-items:center;gap:6px;z-index:5;animation:recBlink 1.2s ease infinite}}
 #rec-badge.visible{{display:flex}} #rec-dot{{width:7px;height:7px;border-radius:50%;background:var(--red)}}
 @keyframes recBlink{{0%,100%{{opacity:1}}50%{{opacity:.55}}}}

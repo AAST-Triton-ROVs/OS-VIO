@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import threading
+import numbers
 from dataclasses import dataclass
 
 from aiohttp import web
@@ -28,6 +29,26 @@ class HudServerContext:
 
 def _create_app(ctx: HudServerContext) -> web.Application:
     routes = web.RouteTableDef()
+
+    def _jsonify(value):
+        if isinstance(value, dict):
+            return {k: _jsonify(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_jsonify(v) for v in value]
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, numbers.Integral):
+            return int(value)
+        if isinstance(value, numbers.Real):
+            return float(value)
+        if hasattr(value, "item"):
+            try:
+                return _jsonify(value.item())
+            except Exception:
+                pass
+        return str(value)
 
     @routes.get("/")
     async def index(request):
@@ -74,13 +95,16 @@ def _create_app(ctx: HudServerContext) -> web.Application:
             while not ctx.stop_event.is_set():
                 frame = ctx.stream_state.get("latest_jpeg")
                 if frame:
-                    await response.write(b"--FRAME\r\nContent-Type:image/jpeg\r\n")
-                    await response.write(f"Content-Length:{len(frame)}\r\n\r\n".encode())
+                    await response.write(b"--FRAME\r\n")
+                    await response.write(b"Content-Type: image/jpeg\r\n")
+                    await response.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
                     await response.write(frame)
                     await response.write(b"\r\n")
                 await asyncio.sleep(0.033)
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            print(f"[STREAM ERROR] {e}")
+            traceback.print_exc()
         return response
 
     @routes.get("/telemetry")
@@ -88,7 +112,7 @@ def _create_app(ctx: HudServerContext) -> web.Application:
         with ctx.hud_lock:
             payload = ctx.hud_telemetry.copy()
         payload["recording"] = ctx.recording_event.is_set()
-        return web.json_response(payload)
+        return web.json_response(_jsonify(payload))
 
     @routes.get("/layout")
     async def get_layout(request):

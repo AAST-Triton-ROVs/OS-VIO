@@ -22,3 +22,11 @@ scan/*.ply
 scan/*.pcd
 scan/poses.json
 scan/intrinsics.json
+# Graphify ignores
+__pycache__/
+*.pyc
+graphify-out/
+.graphifyignore
+CLAUDE.md
+.claude
+

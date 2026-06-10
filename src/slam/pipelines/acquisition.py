@@ -210,6 +210,7 @@ def pin_thread(core_id):
 # THREADS
 # ============================================================
 def visual_worker(ekf, K_mat, T_ic, T_ci):
+    pin_thread(1) # Core 1 dedicated to Visual EKF
     ok = 0
     fail = 0
     while not stop_event.is_set():
@@ -222,7 +223,13 @@ def visual_worker(ekf, K_mat, T_ic, T_ci):
             break
 
         t0 = time.perf_counter()
-        r, n = ekf.update_visual(item[0], item[1], item[2], K_mat, T_ic, T_ci, item[3])
+        # Disentangle the tuple: old signature items (0-3) and dict items (4-5)
+        if len(item) > 4 and isinstance(item[5], dict) and runtime_mode["mode"] == "MSCKF":
+            # Tightly-Coupled MSCKF Path
+            r, n = ekf.add_visual_tracks(item[4], item[5], K_mat, T_ic)
+        else:
+            # Tightly-Coupled Depth-Inertial EKF Update
+            r, n = ekf.update_visual(item[0], item[1], item[2], K_mat, T_ic, T_ci, item[3])
         _observe_latency("visual_ms", (time.perf_counter() - t0) * 1000.0)
         if r: ok += 1
         else: fail += 1
@@ -238,6 +245,7 @@ def imu_worker(device, ekf):
     q = device.getOutputQueue("imu", maxSize=100, blocking=False)
     ab = np.zeros(3, dtype=np.float64)
     gb = np.zeros(3, dtype=np.float64)
+    last_err_ts = 0.0
     
     while not stop_event.is_set():
         try:
@@ -261,6 +269,10 @@ def imu_worker(device, ekf):
                 time.sleep(0.001)
         except Exception as e:
             if stop_event.is_set(): break
+            now = time.monotonic()
+            if now - last_err_ts > 2.0:
+                print(f"[WARN] IMU worker error: {e}")
+                last_err_ts = now
             time.sleep(0.01)
 
 def lk_worker():
@@ -290,6 +302,8 @@ def disk_worker():
                 filepath = filepath.replace('.png', '.u16')
                 img.tofile(filepath)
             else:
+                if len(item) == 3 and item[2]:
+                    img = fast_underwater_restore(img, CR_R_MAX, CR_G_MAX)
                 cv2.imwrite(filepath, img, [cv2.IMWRITE_JPEG_QUALITY, 75])
             _observe_latency("disk_ms", (time.perf_counter() - t0) * 1000.0)
             disk_queue.task_done()
@@ -302,6 +316,14 @@ disk_thread.start()
 # ============================================================
 # PIPELINE CONFIG
 # ============================================================
+print("⏳ Waiting for OAK-D camera to be connected...")
+while True:
+    found, _ = dai.Device.getAnyAvailableDevice()
+    if found:
+        break
+    time.sleep(1)
+print("🔗 Camera detected! Booting hardware...")
+
 pipeline = dai.Pipeline()
 
 calib = None
@@ -368,11 +390,13 @@ stereo.setLeftRightCheck(True)
 
 # Drop down Depth resolution directly to 640x360 to save vast USB bandwidth 
 stereo.setOutputSize(640, 360) 
+stereo.setSubpixel(True)
+stereo.initialConfig.setConfidenceThreshold(200)
 
 cfg = stereo.initialConfig.get()
 cfg.postProcessing.spatialFilter.enable = True
 cfg.postProcessing.spatialFilter.holeFillingRadius = 2
-cfg.postProcessing.temporalFilter.enable = True
+cfg.postProcessing.temporalFilter.enable = False
 cfg.postProcessing.speckleFilter.enable = True
 cfg.postProcessing.speckleFilter.speckleRange = 50
 try:
@@ -627,10 +651,8 @@ with dai.Device(pipeline) as device:
                 # Zero-Math Grayscale: Extracting the Green channel directly
                 gray_curr = raw_rgb[:, :, 1].copy()
                 
-                if CR_ENABLED and CR_REC:
-                    rgb_to_save = fast_underwater_restore(raw_rgb, CR_R_MAX, CR_G_MAX)
-                else:
-                    rgb_to_save = raw_rgb
+                rgb_to_save = raw_rgb
+                apply_restore = bool(CR_ENABLED and CR_REC)
                 
                 if not frame_ok:
                     print(f"  [CAL] Frame: {raw_rgb.shape[1]}×{raw_rgb.shape[0]}")
@@ -806,8 +828,8 @@ with dai.Device(pipeline) as device:
                         })
                         
                         try:
-                            disk_queue.put((os.path.join(RGB_DIR, f"{count:04d}.jpg"), rgb_to_save), timeout=0.5)
-                            disk_queue.put((os.path.join(DEPTH_DIR, f"{count:04d}.png"), dep), timeout=0.5)
+                            disk_queue.put_nowait((os.path.join(RGB_DIR, f"{count:04d}.jpg"), rgb_to_save, apply_restore))
+                            disk_queue.put_nowait((os.path.join(DEPTH_DIR, f"{count:04d}.png"), dep))
                             disk_health["consecutive_drops"] = 0
                         except queue.Full:
                             telemetry_stats["disk_queue_drops"] += 1
@@ -839,13 +861,16 @@ with dai.Device(pipeline) as device:
                             if len(pp) >= MIN_FEAT_UPDATE:
                                 try: 
                                     n_pts = min(len(pp), MAX_FEATURES)
-                                    for i in range(n_pts):
-                                        pp_buffer[i, 0] = pp[i][0]
-                                        pp_buffer[i, 1] = pp[i][1]
-                                        pc_buffer[i, 0] = pc[i][0]
-                                        pc_buffer[i, 1] = pc[i][1]
-                                        
-                                    visual_queue.put_nowait((pp_buffer[:n_pts].copy(), pc_buffer[:n_pts].copy(), prev_depth.copy(), prev_ts))
+                                    pp_buffer[:n_pts] = pp[:n_pts]
+                                    pc_buffer[:n_pts] = pc[:n_pts]
+                                    visual_queue.put_nowait((
+                                        pp_buffer[:n_pts].copy(), 
+                                        pc_buffer[:n_pts].copy(), 
+                                        prev_depth.copy(), 
+                                        prev_ts, 
+                                        count, 
+                                        cf.copy()
+                                    ))
                                 except queue.Full: 
                                     telemetry_stats["visual_queue_drops"] += 1
                                     pass

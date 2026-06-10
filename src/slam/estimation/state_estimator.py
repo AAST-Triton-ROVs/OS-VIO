@@ -1,7 +1,9 @@
+
 import math
 import numpy as np
 import threading
 import cv2
+import scipy.linalg
 from ..shared.helpers import RunningVariance
 from ..shared.settings import CFG
 
@@ -14,6 +16,22 @@ except ImportError:
         if len(args) == 1 and callable(args[0]): return args[0]
         def decorator(func): return func
         return decorator
+
+@njit(cache=True, fastmath=True)
+def huber_weight(res_norm, delta=2.0):
+    if res_norm <= delta:
+        return 1.0
+    return delta / res_norm
+
+@njit(cache=True, fastmath=True)
+def get_chi2_threshold_99(d):
+    if d <= 0: return 0.0
+    return d * (1.0 - 2.0 / (9.0 * d) + 2.32635 * math.sqrt(2.0 / (9.0 * d))) ** 3
+
+@njit(cache=True, fastmath=True)
+def get_chi2_threshold_95(d):
+    if d <= 0: return 0.0
+    return d * (1.0 - 2.0 / (9.0 * d) + 1.64485 * math.sqrt(2.0 / (9.0 * d))) ** 3
 
 # Import EKF constants securely from CFG
 STATIC_VAR_THR   = CFG["ekf_tuning"]["static_variance_threshold"]
@@ -183,6 +201,65 @@ def _mat_to_rotvec_jit(R):
     k=theta/(2.0*math.sin(theta))
     out[0]=(R[2,1]-R[1,2])*k;out[1]=(R[0,2]-R[2,0])*k;out[2]=(R[1,0]-R[0,1])*k;return out
 
+@njit(cache=True, fastmath=True)
+def _compute_visual_jacobians_jit(n_obs, P_world, obs_curr, p, R_imu_T, R_ci, t_ci, fx, fy, cx, cy, z_m, depth_max_m, H_total, r_total, W_huber, R_obs_diag):
+    for i in range(n_obs):
+        p_w = P_world[i]
+        p_curr_i = np.zeros(3)
+        for j in range(3):
+            p_curr_i[j] = R_imu_T[j,0]*(p_w[0]-p[0]) + R_imu_T[j,1]*(p_w[1]-p[1]) + R_imu_T[j,2]*(p_w[2]-p[2])
+            
+        p_c = np.zeros(3)
+        for j in range(3):
+            p_c[j] = R_ci[j,0]*p_curr_i[0] + R_ci[j,1]*p_curr_i[1] + R_ci[j,2]*p_curr_i[2] + t_ci[j]
+            
+        inv_z = 1.0 / max(p_c[2], 1e-3)
+        u_hat = fx * p_c[0] * inv_z + cx
+        v_hat = fy * p_c[1] * inv_z + cy
+        
+        r0 = obs_curr[i,0] - u_hat
+        r1 = obs_curr[i,1] - v_hat
+        r_total[2*i] = r0
+        r_total[2*i+1] = r1
+        
+        res_norm = math.sqrt(r0*r0 + r1*r1)
+        w = 1.0
+        if res_norm > 2.0:
+            w = 2.0 / res_norm
+        W_huber[2*i] = w
+        W_huber[2*i+1] = w
+        
+        J_proj = np.array([
+            [fx*inv_z, 0.0, -fx*p_c[0]*inv_z*inv_z],
+            [0.0, fy*inv_z, -fy*p_c[1]*inv_z*inv_z]
+        ])
+        
+        J_ci = np.zeros((2,3))
+        for r in range(2):
+            for c in range(3):
+                J_ci[r,c] = J_proj[r,0]*R_ci[0,c] + J_proj[r,1]*R_ci[1,c] + J_proj[r,2]*R_ci[2,c]
+                
+        # H_p = J_proj @ R_ci @ (-R_imu_T)
+        for r in range(2):
+            for c in range(3):
+                H_total[2*i+r, c] = -(J_ci[r,0]*R_imu_T[0,c] + J_ci[r,1]*R_imu_T[1,c] + J_ci[r,2]*R_imu_T[2,c])
+                
+        # H_th = J_proj @ R_ci @ skew(p_curr_i)
+        p_curr_i_skew = np.array([
+            [0.0, -p_curr_i[2], p_curr_i[1]],
+            [p_curr_i[2], 0.0, -p_curr_i[0]],
+            [-p_curr_i[1], p_curr_i[0], 0.0]
+        ])
+        for r in range(2):
+            for c in range(3):
+                H_total[2*i+r, 6+c] = J_ci[r,0]*p_curr_i_skew[0,c] + J_ci[r,1]*p_curr_i_skew[1,c] + J_ci[r,2]*p_curr_i_skew[2,c]
+
+        # Depth-weighted noise
+        sigma_px = 1.5 + 0.5 * (z_m[i] / depth_max_m)
+        variance = (sigma_px*sigma_px) / w
+        R_obs_diag[2*i] = variance
+        R_obs_diag[2*i+1] = variance
+
 # ============================================================
 # STATE ESTIMATOR (15-DOF EKF + MSCKF & Pre-Integration)
 # ============================================================
@@ -204,6 +281,12 @@ class VIO_EKF:
         self._w_b=np.zeros(3); self._w_dt=np.zeros(3)
         self._tmp33=np.zeros((3,3)); self._P_tmp=np.zeros((15,15))
         self._tmp15x15 = np.empty((15, 15), dtype=np.float64)
+        
+        # Pre-allocated Jacobian buffers for visual update
+        self._H_total_buf = np.zeros((600, 15), dtype=np.float64)
+        self._r_total_buf = np.zeros(600, dtype=np.float64)
+        self._W_huber_buf = np.ones(600, dtype=np.float64)
+        self._R_obs_diag_buf = np.zeros(600, dtype=np.float64)
         
         self.gravity_world=None; self.gravity_ready=False
         self._var_tracker=RunningVariance(STATIC_WIN)
@@ -327,6 +410,10 @@ class VIO_EKF:
             ACCEL_ND**2, GYRO_ND**2, ACCEL_BRW**2, GYRO_BRW**2,
             self._step_count, REORTHO_INTERVAL, self._tmp15x15
         )
+        
+        # Zero Velocity Update (ZUPT): Gently decay velocity to zero if static
+        if self.gravity_ready and self._var_tracker.is_full() and self._var_tracker.variance() < STATIC_VAR_THR:
+            self.v *= 0.98
 
     def set_keyframe(self):
         with self._lock: 
@@ -358,209 +445,159 @@ class VIO_EKF:
 
     def update_visual(self, prev_pts, curr_pts, prev_depth, K, T_ic, T_ci, frame_ts=None):
         """
-        Performs a tightly-coupled visual correction using depth-backed 3D-2D PnP.
+        COMMERCIAL GRADE: Tightly-Coupled Depth-Inertial EKF Update with Huber Loss.
+        Bypasses PnP posing and updates IMU state directly from pixel residuals.
         """
         with self._lock:
-            if not self.gravity_ready:
-                return False, 0
+            if not self.gravity_ready: return False, 0
+            if prev_pts is None or curr_pts is None or prev_depth is None: return False, 0
+            if len(prev_pts) < MIN_FEAT_UPDATE: return False, 0
 
-            if prev_pts is None or curr_pts is None or prev_depth is None:
-                return False, 0
-            if len(prev_pts) < MIN_FEAT_UPDATE or len(curr_pts) < MIN_FEAT_UPDATE:
-                return False, 0
+            fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+            
+            # --- 1. DEPTH LOOKUP & 3D REPROJECTION ---
+            depth_h, depth_w = prev_depth.shape[:2]
+            scale_x, scale_y = depth_w / (2.0*cx), depth_h / (2.0*cy)
+            xs, ys = (prev_pts[:, 0] * scale_x), (prev_pts[:, 1] * scale_y)
+            z_mm = _batch_depth_lookup_jit(prev_depth, xs, ys, DEPTH_PATCH_R, depth_h, depth_w, DEPTH_MIN_MM, DEPTH_MAX_MM)
+            valid = z_mm > 0.0
+            if int(np.count_nonzero(valid)) < MIN_FEAT_UPDATE: return False, 0
 
+            # Reset visual reference pose on time gaps
             if self._last_vis_ts is not None and frame_ts is not None:
                 dt = float(frame_ts - self._last_vis_ts)
                 if dt <= 0.0 or dt > 0.5:
-                    self._last_vis_cam_pose = None
+                    self._last_v_p = None
+                    self._last_v_R = None
 
-            fx, fy = float(K[0, 0]), float(K[1, 1])
-            cx, cy = float(K[0, 2]), float(K[1, 2])
-
-            # Feature tracks come from ISP resolution, depth may be downscaled.
-            # Scale feature coordinates into the depth map before depth lookup.
-            depth_h, depth_w = prev_depth.shape[:2]
-            track_w = max(1.0, 2.0 * cx)
-            track_h = max(1.0, 2.0 * cy)
-            scale_x = depth_w / track_w
-            scale_y = depth_h / track_h
-
-            xs = (prev_pts[:, 0] * scale_x).astype(np.float64, copy=False)
-            ys = (prev_pts[:, 1] * scale_y).astype(np.float64, copy=False)
-            z_mm = _batch_depth_lookup_jit(
-                prev_depth,
-                xs,
-                ys,
-                DEPTH_PATCH_R,
-                depth_h,
-                depth_w,
-                DEPTH_MIN_MM,
-                DEPTH_MAX_MM,
-            )
-            valid = z_mm > 0.0
-            if int(np.count_nonzero(valid)) < MIN_FEAT_UPDATE:
-                return False, int(np.count_nonzero(valid))
-
-            z = (z_mm[valid] * 1e-3).astype(np.float64, copy=False)
-            up = prev_pts[valid, 0].astype(np.float64, copy=False)
-            vp = prev_pts[valid, 1].astype(np.float64, copy=False)
-            uc = curr_pts[valid, 0].astype(np.float64, copy=False)
-            vc = curr_pts[valid, 1].astype(np.float64, copy=False)
-
-            X = (up - cx) * z / fx
-            Y = (vp - cy) * z / fy
-            obj_pts = np.stack([X, Y, z], axis=1).astype(np.float32)
-            img_pts = np.stack([uc, vc], axis=1).astype(np.float32)
-
-            if obj_pts.shape[0] < 6:
-                return False, int(obj_pts.shape[0])
-
-            ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-                obj_pts,
-                img_pts,
-                K.astype(np.float64),
-                None,
-                flags=cv2.SOLVEPNP_ITERATIVE,
-                iterationsCount=100,
-                reprojectionError=3.0,
-                confidence=0.99,
-            )
-            if not ok or inliers is None or len(inliers) < 6:
+            if self._last_v_p is None:
+                self._last_v_p = self.p.copy()
+                self._last_v_R = self.R.copy()
+                self._last_vis_ts = frame_ts
                 return False, 0
-
-            inl = inliers.flatten()
-            obj_inl = obj_pts[inl]
-            img_inl = img_pts[inl]
-
-            ok_refine, rvec, tvec = cv2.solvePnP(
-                obj_inl,
-                img_inl,
-                K.astype(np.float64),
-                None,
-                rvec=rvec,
-                tvec=tvec,
-                useExtrinsicGuess=True,
-                flags=cv2.SOLVEPNP_ITERATIVE,
+                
+            # Transform points into IMU frame (3D landmarks relative to PREVIOUS IMU)
+            z = z_mm[valid] * 1e-3
+            X_c = (prev_pts[valid,0] - cx) * z / fx
+            Y_c = (prev_pts[valid,1] - cy) * z / fy
+            P_c_prev = np.stack([X_c, Y_c, z], axis=1)
+            P_i_prev = (T_ic[:3,:3] @ P_c_prev.T + T_ic[:3,3:4]).T
+            
+            # Map landmarks to GLOBAL WORLD frame using previous IMU pose
+            P_world = (self._last_v_R @ P_i_prev.T).T + self._last_v_p
+            
+            obs_curr = curr_pts[valid] # 2D observations in current frame
+            n_obs = min(len(obs_curr), 300)
+            
+            # --- 2. ITERATIVE TIGHTLY-COUPLED UPDATE ---
+            R_ic = T_ic[:3,:3]; t_ic = T_ic[:3,3]
+            R_ci = T_ci[:3,:3]; t_ci = T_ci[:3,3]
+            
+            H_total = self._H_total_buf[:n_obs * 2]
+            r_total = self._r_total_buf[:n_obs * 2]
+            W_huber = self._W_huber_buf[:n_obs * 2]
+            R_obs_diag = self._R_obs_diag_buf[:n_obs * 2]
+            
+            H_total.fill(0.0)
+            
+            R_imu_T = self.R.T
+            
+            _compute_visual_jacobians_jit(
+                n_obs, P_world, obs_curr, self.p, R_imu_T, R_ci, t_ci,
+                fx, fy, cx, cy, z, float(DEPTH_MAX_MM) * 1e-3,
+                H_total, r_total, W_huber, R_obs_diag
             )
-            if not ok_refine:
-                return False, int(len(inl))
 
-            reproj, _ = cv2.projectPoints(obj_inl, rvec, tvec, K.astype(np.float64), None)
-            reproj_err = img_inl - reproj.reshape(-1, 2)
-            rmse = float(np.sqrt(np.mean(np.sum(reproj_err * reproj_err, axis=1))))
-
-            R_pc, _ = cv2.Rodrigues(rvec)
-            t_pc = tvec.reshape(3).astype(np.float64)
-
-            if self._last_vis_cam_pose is None:
-                R_wc_init = self.R @ T_ic[:3, :3]
-                p_wc_init = self.p + self.R @ T_ic[:3, 3]
-                self._last_vis_cam_pose = (R_wc_init.copy(), p_wc_init.copy())
-                self._last_vis_ts = frame_ts
-                return False, int(len(inl))
-
-            R_wc_prev, p_wc_prev = self._last_vis_cam_pose
-            R_wc_meas = R_wc_prev @ R_pc.T
-            p_wc_meas = p_wc_prev - (R_wc_meas @ t_pc)
-
-            # Convert measured world camera pose to measured world IMU pose.
-            R_wi_meas = R_wc_meas @ T_ci[:3, :3]
-            p_wi_meas = p_wc_meas + (R_wc_meas @ T_ci[:3, 3])
-
-            r_p = p_wi_meas - self.p
-            r_th = _mat_to_rotvec_jit(self.R.T @ R_wi_meas)
-            if not np.isfinite(r_p).all() or not np.isfinite(r_th).all():
-                return False, int(len(inl))
-
-            if np.linalg.norm(r_p) > 2.0 or np.linalg.norm(r_th) > np.deg2rad(40.0):
-                self._last_vis_cam_pose = None
-                self._last_vis_ts = frame_ts
-                return False, int(len(inl))
-
-            inlier_ratio = float(len(inl)) / float(obj_pts.shape[0])
-            sigma_p = float(np.clip(0.02 + 0.10 * rmse + (1.0 - inlier_ratio) * 0.08, 0.01, 0.30))
-            sigma_r = float(np.clip(np.deg2rad(0.8 + 8.0 * rmse + (1.0 - inlier_ratio) * 8.0),
-                                    np.deg2rad(0.5), np.deg2rad(20.0)))
-
-            Rm = np.diag([sigma_p * sigma_p] * 3 + [sigma_r * sigma_r] * 3).astype(np.float64)
-            Rm *= self._vis_noise_scale
-            H = np.zeros((6, 15), dtype=np.float64)
-            H[:3, :3] = np.eye(3)
-            H[3:, 6:9] = np.eye(3)
-
-            r = np.hstack([r_p, r_th]).astype(np.float64)
-            S = H @ self.P @ H.T + Rm
+            # Measurement Noise Covariance
+            R_obs = np.diag(R_obs_diag)
+            
+            S = H_total @ self.P @ H_total.T + R_obs
             try:
-                S_inv_r = np.linalg.solve(S, r)
-                nis = float(r @ S_inv_r)
+                # Optimized solve using Cholesky decomposition: K = (S⁻¹ H P)ᵀ
+                c_and_lower = scipy.linalg.cho_factor(S, lower=True)
+                K_gain = scipy.linalg.cho_solve(c_and_lower, H_total @ self.P).T
+                dx = K_gain @ r_total
+                
+                # Apply Correction
+                self.p += dx[0:3]
+                self.v += dx[3:6]
+                _rodrigues_jit(dx[6], dx[7], dx[8], self._tmp33)
+                _mat3_mul(self.R, self._tmp33, self._dR)
+                self.R[:] = self._dR
+                self.ba += dx[9:12]
+                self.bg += dx[12:15]
+                
+                I = np.eye(15)
+                KH = K_gain @ H_total
+                self.P = (I - KH) @ self.P @ (I - KH).T + K_gain @ R_obs @ K_gain.T
+                self.P = 0.5 * (self.P + self.P.T)
+                
+                # NIS Logging
+                nis = float(r_total @ np.linalg.solve(S, r_total))
                 self._vis_last_nis = nis
                 self._vis_nis_ema = 0.9 * self._vis_nis_ema + 0.1 * nis
-                # Adaptive visual noise + consistency gating.
-                if nis > VIS_NIS_CHI2_99 * max(1.0, self._vis_noise_scale):
+                
+                # Adaptive visual noise + consistency gating using dynamic Chi-squared threshold
+                chi2_threshold = get_chi2_threshold_99(n_obs * 2)
+                if nis > chi2_threshold * max(1.0, self._vis_noise_scale):
                     self._vis_reject_streak += 1
                     self._vis_reject_count += 1
                     self._vis_noise_scale = min(12.0, self._vis_noise_scale * 1.25)
+                    
+                    # Update reference pose with EKF's best estimate (current propagated state) on rejection
+                    self._last_v_p = self.p.copy()
+                    self._last_v_R = self.R.copy()
+                    self._last_vis_ts = frame_ts
+                    
                     self.residual_log.append({
                         "tick": self._step_count,
                         "type": "visual_reject_nis",
                         "nis": nis,
                         "noise_scale": float(self._vis_noise_scale),
-                        "inliers": int(len(inl)),
+                        "inliers": n_obs,
                     })
-                    return False, int(len(inl))
+                    return False, n_obs
 
-                if nis > VIS_NIS_CHI2_95:
+                # Dynamically calculate the 95% threshold for adaptive scaling
+                chi2_threshold_95 = get_chi2_threshold_95(n_obs * 2)
+                if nis > chi2_threshold_95:
                     self._vis_noise_scale = min(12.0, self._vis_noise_scale * 1.10)
                 else:
                     self._vis_noise_scale = max(1.0, self._vis_noise_scale * 0.985)
 
-                K_gain = self.P @ H.T @ np.linalg.inv(S)
-            except np.linalg.LinAlgError:
-                return False, int(len(inl))
-
-            dx = K_gain @ r
-            self.p += dx[0:3]
-            self.v += dx[3:6]
-            dth = dx[6:9]
-            dR, _ = cv2.Rodrigues(dth.astype(np.float64))
-            self.R = self.R @ dR
-            self.ba += dx[9:12]
-            self.bg += dx[12:15]
-
-            I = np.eye(15, dtype=np.float64)
-            KH = K_gain @ H
-            self.P = (I - KH) @ self.P @ (I - KH).T + K_gain @ Rm @ K_gain.T
-            self.P = 0.5 * (self.P + self.P.T)
+            except (np.linalg.LinAlgError, ValueError):
+                # Update reference pose on math error as well
+                self._last_v_p = self.p.copy()
+                self._last_v_R = self.R.copy()
+                self._last_vis_ts = frame_ts
+                return False, n_obs
 
             if np.isnan(self.p).any() or np.isnan(self.R).any() or np.isnan(self.P).any():
                 if self._last_v_p is not None:
                     self.p[:] = self._last_v_p
                     self.R[:] = self._last_v_R
                 self.P[:] = np.eye(15, dtype=np.float64) * 1e-3
-                return False, int(len(inl))
+                return False, n_obs
 
             self._last_v_p = self.p.copy()
             self._last_v_R = self.R.copy()
             self._vis_reject_streak = 0
             self._vis_accept_count += 1
+            
             R_wc_corr = self.R @ T_ic[:3, :3]
             p_wc_corr = self.p + self.R @ T_ic[:3, 3]
             self._last_vis_cam_pose = (R_wc_corr.copy(), p_wc_corr.copy())
             self._last_vis_ts = frame_ts
-
+            
             self.residual_log.append({
                 "tick": self._step_count,
-                "type": "visual_pnp",
-                "inliers": int(len(inl)),
-                "tracks": int(obj_pts.shape[0]),
-                "inlier_ratio": inlier_ratio,
-                "reproj_rmse_px": rmse,
-                "pos_residual_m": float(np.linalg.norm(r_p)),
-                "rot_residual_deg": float(np.rad2deg(np.linalg.norm(r_th))),
-                "nis": float(self._vis_last_nis),
-                "noise_scale": float(self._vis_noise_scale),
+                "type": "visual_tight",
+                "inliers": n_obs,
+                "tracks": n_obs,
+                "rmse": float(nis),
+                "rejected": False,
             })
-            return True, int(len(inl))
+            return True, n_obs
 
     def add_visual_tracks(self, frame_id, features_dict, K, T_ic):
         """
@@ -600,14 +637,60 @@ class VIO_EKF:
             total_r_o_norm = 0.0
             processed_tracks = 0
             
+            r_msckf = []
+            H_msckf = []
+            
+            # Compute T_ci for coordinate mapping
+            T_ci = np.eye(4)
+            R_ic = T_ic[:3, :3]
+            t_ic = T_ic[:3, 3]
+            T_ci[:3, :3] = R_ic.T
+            T_ci[:3, 3] = -R_ic.T @ t_ic
+            
             for fid in lost_ids:
                 track = self.tracks[fid]
                 if len(track["obs"]) >= MIN_TRACK:
-                    r_o = self._process_msckf_feature(track, K)
-                    if r_o is not None:
-                        total_r_o_norm += np.linalg.norm(r_o)
-                        processed_tracks += 1
+                    res = self._process_msckf_feature(track, K, T_ic, T_ci)
+                    if res is not None:
+                        r_o, H_o = res
+                        # Chi-squared consistency gate for the feature track
+                        track_nis = float(r_o @ r_o) / (1.5**2)
+                        track_threshold = get_chi2_threshold_99(len(r_o))
+                        if track_nis <= track_threshold:
+                            r_msckf.append(r_o)
+                            H_msckf.append(H_o)
+                            total_r_o_norm += np.linalg.norm(r_o)
+                            processed_tracks += 1
                 del self.tracks[fid]
+                
+            # Apply EKF Update using stacked projected residuals and Jacobians
+            if processed_tracks > 0:
+                r_total = np.concatenate(r_msckf)
+                H_total = np.vstack(H_msckf)
+                
+                R_obs = np.eye(len(r_total)) * (1.5**2)
+                S = H_total @ self.P @ H_total.T + R_obs
+                
+                try:
+                    # Solve for Kalman Gain: K = (S⁻¹ H P)ᵀ
+                    K_gain = np.linalg.solve(S, H_total @ self.P).T
+                    dx = K_gain @ r_total
+                    
+                    # Apply Correction to EKF State
+                    self.p += dx[0:3]
+                    self.v += dx[3:6]
+                    _rodrigues_jit(dx[6], dx[7], dx[8], self._tmp33)
+                    _mat3_mul(self.R, self._tmp33, self._dR)
+                    self.R[:] = self._dR
+                    self.ba += dx[9:12]
+                    self.bg += dx[12:15]
+                    
+                    I = np.eye(15)
+                    KH = K_gain @ H_total
+                    self.P = (I - KH) @ self.P @ (I - KH).T + K_gain @ R_obs @ K_gain.T
+                    self.P = 0.5 * (self.P + self.P.T)
+                except np.linalg.LinAlgError:
+                    pass
                 
             # --- 4. SAFETY NETS & LOGGING ---
             if processed_tracks > 0:
@@ -632,7 +715,7 @@ class VIO_EKF:
 
             return True, processed_tracks
 
-    def _process_msckf_feature(self, track, K):
+    def _process_msckf_feature(self, track, K, T_ic, T_ci):
         obs = track["obs"]
         first_obs, last_obs = obs[0], obs[-1]
         
@@ -652,7 +735,11 @@ class VIO_EKF:
         p4d = cv2.triangulatePoints(P1.astype(np.float32), P2.astype(np.float32), pt1, pt2)
         p3d_w = (p4d[:3] / (p4d[3] + 1e-6)).flatten()
         
-        r_stack, Hf_stack = [], []
+        r_stack, Hf_stack, Hx_stack = [], [], []
+        
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+        R_ci = T_ci[:3,:3]; t_ci = T_ci[:3,3]
+        R_ic = T_ic[:3,:3]; t_ic = T_ic[:3,3]
         
         for frame_id, u, v in obs:
             c_pose = next((p for p in self.window if p["id"] == frame_id), None)
@@ -663,11 +750,12 @@ class VIO_EKF:
             
             if z_depth < 0.1: continue # Reject points behind camera
             
-            u_hat = K[0,0] * (pc_x / z_depth) + K[0,2]
-            v_hat = K[1,1] * (pc_y / z_depth) + K[1,2]
+            u_hat = fx * (pc_x / z_depth) + cx
+            v_hat = fy * (pc_y / z_depth) + cy
             
             r_stack.append([u - u_hat, v - v_hat])
             
+            # Jacobian w.r.t landmark position
             dz_dp = np.array([
                 [1/z_depth, 0, -pc_x/(z_depth**2)],
                 [0, 1/z_depth, -pc_y/(z_depth**2)]
@@ -675,14 +763,32 @@ class VIO_EKF:
             Hf = dz_dp @ c_pose["R"].T
             Hf_stack.append(Hf)
             
+            # Jacobian w.r.t EKF state (recovered IMU pose)
+            R_imu = c_pose["R"] @ R_ci
+            p_imu = c_pose["p"] - R_imu @ t_ic
+            p_curr_i = R_imu.T @ (p3d_w - p_imu)
+            
+            J_proj = np.array([[fx/z_depth, 0, -fx*pc_x/(z_depth**2)],
+                               [0, fy/z_depth, -fy*pc_y/(z_depth**2)]])
+            
+            H_p = J_proj @ R_ci @ (-R_imu.T)
+            H_th = J_proj @ R_ci @ skew(p_curr_i)
+            
+            Hx = np.zeros((2, 15), dtype=np.float64)
+            Hx[:, :3] = H_p
+            Hx[:, 6:9] = H_th
+            Hx_stack.append(Hx)
+            
         if len(r_stack) < MIN_TRACK: return None
         
         r_vec = np.vstack(r_stack).flatten()
         Hf_mat = np.vstack(Hf_stack)
+        Hx_mat = np.vstack(Hx_stack)
         
         # Left Null-Space Projection (Hardware Accelerated)
         r_o, A = project_nullspace(Hf_mat, r_vec)
-        return r_o
+        H_o = A.T @ Hx_mat
+        return r_o, H_o
 
     def get_pose(self):
         with self._lock:

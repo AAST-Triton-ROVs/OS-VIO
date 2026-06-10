@@ -101,7 +101,7 @@
     "appearance_gate": {
       "enabled": true,
       "similarity_threshold": 0.55,
-      "spatial_gate_multiplier": 3.0
+      "spatial_gate_multiplier": 6.0
     },
     "loop_closure_interval": 10,
     "min_loop_frame_distance": 50,

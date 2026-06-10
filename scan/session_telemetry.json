@@ -1,0 +1,44 @@
+{
+  "visual_queue_drops": 0,
+  "disk_queue_drops": 0,
+  "forced_gaps_accepted": 0,
+  "sync_warnings": 50,
+  "budget_violations": 0,
+  "mode_transitions": [],
+  "recovered_from_pressure": 0,
+  "latency_summary_ms": {
+    "visual": {
+      "count": 45,
+      "p50": 0.14124900008027907,
+      "p95": 0.4404107998198013,
+      "p99": 6.039715160077341
+    },
+    "disk": {
+      "count": 16,
+      "p50": 1.5657435001230624,
+      "p95": 2.7181730002894255,
+      "p99": 3.1901522001362532
+    },
+    "main_loop": {
+      "count": 600,
+      "p50": 1.1361929998656706,
+      "p95": 1.5124370500870983,
+      "p99": 9.561565529829744
+    }
+  },
+  "final_adaptive_gap": 3,
+  "final_mode": "BOOT",
+  "sync": {
+    "offset_ms": 2331647.7052714475,
+    "drift_ms_per_s": 601.8583167985653
+  },
+  "ekf_visual_health": {
+    "mode": "NOMINAL",
+    "noise_scale": 1.0,
+    "reject_streak": 0,
+    "accept_count": 0,
+    "reject_count": 0,
+    "nis_ema": 0.0,
+    "nis_last": 0.0
+  }
+}

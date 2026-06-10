@@ -160,3 +160,6 @@ class RunningVariance:
     def variance(self):
         if not self._full: return 1e9
         return float(np.var(self._buf)) # Mathematically stable, C-optimized
+
+    def is_full(self):
+        return self._full
