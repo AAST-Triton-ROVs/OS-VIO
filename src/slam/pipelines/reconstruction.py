@@ -146,9 +146,11 @@ TSDF_MAX_TRACKING_ERROR_SKIP = TSDF_Q_CFG.get("max_tracking_rmse_skip", 0.18)
 VOXEL_TSDF_BASE = R_CFG["voxel_tsdf_m"]
 HAS_CUDA = o3c.cuda.is_available()
 GPU_DEVICE = o3c.Device("CUDA:0") if HAS_CUDA else o3c.Device("CPU:0")
-VOXEL_TSDF = VOXEL_TSDF_BASE if HAS_CUDA else max(0.015, VOXEL_TSDF_BASE)
+# The quantization memory optimizations allow us to bypass the 15mm legacy CPU clamp
+# and use the high-performance Tensor TSDF framework natively on the CPU!
+VOXEL_TSDF = VOXEL_TSDF_BASE
 SDF_TRUNC = VOXEL_TSDF * 4.0
-TSDF_MODE = "TENSOR" if HAS_CUDA else "LEGACY"
+TSDF_MODE = "TENSOR"
 TSDF_GC_INTERVAL = 60
 TSDF_VRAM_LOG_INTERVAL = 120
 

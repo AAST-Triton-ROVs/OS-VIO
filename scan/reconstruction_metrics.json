@@ -1,0 +1,34 @@
+{
+    "timing": {
+        "total_seconds": 15.53366565000033
+    },
+    "phase_1_tracking": {
+        "frames_processed": 8,
+        "icp_successes": 7,
+        "icp_failures": 0,
+        "median_fitness": 0.9784012208005635,
+        "aperture_prone_frames": 0
+    },
+    "phase_2_loop_closure": {
+        "loops_found": 0,
+        "candidates_tried": 0,
+        "candidates_rejected": 0,
+        "spatial_gate_skipped": 0
+    },
+    "phase_3_optimization": {
+        "mean_shift_m": 0.01544994482408645,
+        "max_shift_m": 0.03163696137855715
+    },
+    "phase_4_tsdf": {
+        "frames_integrated": 2,
+        "frames_quarantined_bad": 0,
+        "frames_quarantined_tracking": 0,
+        "frames_quarantined_depth_confidence": 0,
+        "dynamic_depth_truncation": true,
+        "final_depth_trunc_m": 4.2388175
+    },
+    "phase_5_mesh": {
+        "vertices": 4445,
+        "triangles": 6909
+    }
+}

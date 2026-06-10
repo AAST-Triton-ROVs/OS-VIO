@@ -2,7 +2,7 @@
   "_comment_GLOBAL": "Triton ROV Master Config. Split into Pi 4 (Edge) and Base Station (Host) domains.",
   
   "paths": {
-    "scan_dir": "./scan"
+    "scan_dir": "/home/marwan/slam/coral_scan2"
   },
 
   "_comment_DOMAIN_1": "====== ON-BOARD ACQUISITION (RASPBERRY PI 4) ======",
@@ -92,7 +92,7 @@
 
   "_comment_DOMAIN_2": "====== OFFLINE RECONSTRUCTION (POWERFUL STATION) ======",
 
-  "reconstruction_mode": "ultra",
+  "reconstruction_mode": "original",
 
   "reconstruction_profiles": {
     "ultra": {
@@ -114,22 +114,22 @@
       "min_cloud_points": 400
     },
     "original": {
-      "depth_quantile_pruning": 0.95,
-      "voxel_tracking_m": 0.015,
-      "voxel_loop_m": 0.03,
+      "depth_quantile_pruning": 1.0,
+      "voxel_tracking_m": 0.008,
+      "voxel_loop_m": 0.015,
       "voxel_tsdf_m": 0.004,
       "_voxel_tsdf_why": "4mm resolution. Tighter than your original 5mm baseline, taking advantage of the new memory headroom.",
       "appearance_gate": {
         "enabled": true,
-        "similarity_threshold": 0.55,
-        "spatial_gate_multiplier": 6.0
+        "similarity_threshold": 0.70,
+        "spatial_gate_multiplier": 8.0
       },
-      "loop_closure_interval": 8,
-      "min_loop_frame_distance": 40,
-      "allow_multi_loops": false,
-      "loop_top_k": 5,
+      "loop_closure_interval": 3,
+      "min_loop_frame_distance": 20,
+      "allow_multi_loops": true,
+      "loop_top_k": 15,
       "z_regularize": true,
-      "min_cloud_points": 250
+      "min_cloud_points": 400
     },
     "balanced": {
       "depth_quantile_pruning": 0.92,
