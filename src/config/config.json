@@ -92,23 +92,63 @@
 
   "_comment_DOMAIN_2": "====== OFFLINE RECONSTRUCTION (POWERFUL STATION) ======",
 
-  "reconstruction": {
-    "depth_quantile_pruning": 0.95,
-    "voxel_tracking_m": 0.02,
-    "voxel_loop_m": 0.04,
-    "voxel_tsdf_m": 0.005,
-    "_voxel_tsdf_why": "5mm resolution. This requires massive VRAM and computational power (O(N^3) complexity). Safe here because it runs on the base station, not the Pi.",
-    "appearance_gate": {
-      "enabled": true,
-      "similarity_threshold": 0.55,
-      "spatial_gate_multiplier": 6.0
+  "reconstruction_mode": "ultra",
+
+  "reconstruction_profiles": {
+    "ultra": {
+      "depth_quantile_pruning": 1.0,
+      "voxel_tracking_m": 0.008,
+      "voxel_loop_m": 0.015,
+      "voxel_tsdf_m": 0.0015,
+      "_voxel_tsdf_why": "1.5mm resolution! Now possible due to uint8/uint16 quantization memory savings.",
+      "appearance_gate": {
+        "enabled": true,
+        "similarity_threshold": 0.70,
+        "spatial_gate_multiplier": 8.0
+      },
+      "loop_closure_interval": 3,
+      "min_loop_frame_distance": 20,
+      "allow_multi_loops": true,
+      "loop_top_k": 15,
+      "z_regularize": true,
+      "min_cloud_points": 400
     },
-    "loop_closure_interval": 10,
-    "min_loop_frame_distance": 50,
-    "allow_multi_loops": false,
-    "loop_top_k": 3,
-    "z_regularize": true,
-    "min_cloud_points": 200
+    "original": {
+      "depth_quantile_pruning": 0.95,
+      "voxel_tracking_m": 0.015,
+      "voxel_loop_m": 0.03,
+      "voxel_tsdf_m": 0.004,
+      "_voxel_tsdf_why": "4mm resolution. Tighter than your original 5mm baseline, taking advantage of the new memory headroom.",
+      "appearance_gate": {
+        "enabled": true,
+        "similarity_threshold": 0.55,
+        "spatial_gate_multiplier": 6.0
+      },
+      "loop_closure_interval": 8,
+      "min_loop_frame_distance": 40,
+      "allow_multi_loops": false,
+      "loop_top_k": 5,
+      "z_regularize": true,
+      "min_cloud_points": 250
+    },
+    "balanced": {
+      "depth_quantile_pruning": 0.92,
+      "voxel_tracking_m": 0.025,
+      "voxel_loop_m": 0.05,
+      "voxel_tsdf_m": 0.008,
+      "_voxel_tsdf_why": "8mm resolution. Excellent balance of speed and quality.",
+      "appearance_gate": {
+        "enabled": false,
+        "similarity_threshold": 0.55,
+        "spatial_gate_multiplier": 6.0
+      },
+      "loop_closure_interval": 12,
+      "min_loop_frame_distance": 60,
+      "allow_multi_loops": false,
+      "loop_top_k": 2,
+      "z_regularize": true,
+      "min_cloud_points": 150
+    }
   },
 
   "loop_closure_quality": {

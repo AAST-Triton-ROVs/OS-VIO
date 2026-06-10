@@ -23,18 +23,22 @@ from ..shared.helpers import mem, ETA, PromiseLRU, HAS_NUMBA, _vram, _avail
 # THREAD CONTROL — before open3d internals spin up
 # ============================================================
 
-os.environ["OMP_NUM_THREADS"]      = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"]      = "1"
-os.environ["OMP_WAIT_POLICY"]      = "PASSIVE"
-
 try:
     _ncpu = len(os.sched_getaffinity(0))
 except AttributeError:
     import multiprocessing
     _ncpu = multiprocessing.cpu_count()
 
-_phys = max(1, _ncpu // 2) if _ncpu <= 4 else _ncpu
+# Dynamically allocate OpenMP threads based on CPU count to allow Open3D to use multiple cores
+# while limiting Python ThreadPools to prevent massive thread oversubscription thrashing.
+_omp = str(max(2, _ncpu // 4)) if _ncpu > 4 else "2"
+
+os.environ["OMP_NUM_THREADS"]      = _omp
+os.environ["OPENBLAS_NUM_THREADS"] = _omp
+os.environ["MKL_NUM_THREADS"]      = _omp
+os.environ["OMP_WAIT_POLICY"]      = "PASSIVE"
+
+_phys = max(1, _ncpu // 2)
 
 import open3d.core as o3c
 o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
@@ -114,15 +118,18 @@ OPENCL_AVAILABLE = ENABLE_INTEL_IGPU and cv2.ocl.haveOpenCL()
 DEPTH_TRUNC_DEFAULT = 3.0
 DEPTH_TRUNC_PADDING = 0.3
 
-DEPTH_QUANTILE = CFG["reconstruction"]["depth_quantile_pruning"]
-VOXEL_TRACKING = CFG["reconstruction"]["voxel_tracking_m"]
-VOXEL_LOOP     = CFG["reconstruction"]["voxel_loop_m"]
-LOOP_CLOSURE_INTERVAL   = CFG["reconstruction"]["loop_closure_interval"]
-MIN_LOOP_FRAME_DISTANCE = CFG["reconstruction"]["min_loop_frame_distance"]
-ALLOW_MULTI_LOOPS       = CFG["reconstruction"]["allow_multi_loops"]
-Z_REGULARIZE            = CFG["reconstruction"]["z_regularize"]
-MIN_CLOUD_PTS           = CFG["reconstruction"]["min_cloud_points"]
-LOOP_TOP_K              = CFG["reconstruction"]["loop_top_k"]
+R_MODE = CFG.get("reconstruction_mode", "original")
+R_CFG = CFG.get("reconstruction_profiles", {}).get(R_MODE, CFG.get("reconstruction", {}))
+
+DEPTH_QUANTILE = R_CFG["depth_quantile_pruning"]
+VOXEL_TRACKING = R_CFG["voxel_tracking_m"]
+VOXEL_LOOP     = R_CFG["voxel_loop_m"]
+LOOP_CLOSURE_INTERVAL   = R_CFG["loop_closure_interval"]
+MIN_LOOP_FRAME_DISTANCE = R_CFG["min_loop_frame_distance"]
+ALLOW_MULTI_LOOPS       = R_CFG["allow_multi_loops"]
+Z_REGULARIZE            = R_CFG["z_regularize"]
+MIN_CLOUD_PTS           = R_CFG["min_cloud_points"]
+LOOP_TOP_K              = R_CFG["loop_top_k"]
 
 LOOP_CFG = CFG.get("loop_closure_quality", {})
 LOOP_MAX_TRANS_RESIDUAL_M = LOOP_CFG.get("max_translation_residual_m", 1.2)
@@ -136,7 +143,7 @@ TSDF_DYNAMIC_TRUNC = TSDF_Q_CFG.get("dynamic_depth_truncation", True)
 TSDF_DYNAMIC_ALPHA = TSDF_Q_CFG.get("dynamic_trunc_ewma_alpha", 0.15)
 TSDF_MAX_TRACKING_ERROR_SKIP = TSDF_Q_CFG.get("max_tracking_rmse_skip", 0.18)
 
-VOXEL_TSDF_BASE = CFG["reconstruction"]["voxel_tsdf_m"]
+VOXEL_TSDF_BASE = R_CFG["voxel_tsdf_m"]
 HAS_CUDA = o3c.cuda.is_available()
 GPU_DEVICE = o3c.Device("CUDA:0") if HAS_CUDA else o3c.Device("CPU:0")
 VOXEL_TSDF = VOXEL_TSDF_BASE if HAS_CUDA else max(0.015, VOXEL_TSDF_BASE)
@@ -1211,7 +1218,7 @@ if HAS_CUDA:
 
     vbg = o3d.t.geometry.VoxelBlockGrid(
         attr_names=("tsdf", "weight", "color"),
-        attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
+        attr_dtypes=(o3c.float32, o3c.uint16, o3c.uint8),
         attr_channels=((1,), (1,), (3,)),
         voxel_size=VOXEL_TSDF, block_resolution=16,
         block_count=bc, device=GPU_DEVICE

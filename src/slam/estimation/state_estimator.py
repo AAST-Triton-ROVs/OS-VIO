@@ -8,10 +8,11 @@ from ..shared.helpers import RunningVariance
 from ..shared.settings import CFG
 
 try:
-    from numba import njit
+    from numba import njit, prange
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
+    prange = range
     def njit(*args, **kwargs):
         if len(args) == 1 and callable(args[0]): return args[0]
         def decorator(func): return func
@@ -170,10 +171,10 @@ def _propagate_state_jit(p,v,R,ba,bg,accel_raw,gyro_raw,dt,gravity_world,F,Qd,P,
     _build_F_and_Qd_jit(F,Qd,R,a_b,w_b,dt,na_var,ng_var,nba_var,nbg_var);_triple_product_15(F,P,Qd,P,tmp15);_symmetrise_15(P)
     return step_count
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, parallel=True)
 def _batch_depth_lookup_jit(depth_map,xs,ys,r,h,w,min_mm,max_mm):
     n=len(xs);result=np.zeros(n,dtype=np.float64)
-    for idx in range(n):
+    for idx in prange(n):
         xi=int(round(xs[idx]));yi=int(round(ys[idx]))
         if xi<r: xi=r
         if xi>=w-r: xi=w-r-1
@@ -201,9 +202,9 @@ def _mat_to_rotvec_jit(R):
     k=theta/(2.0*math.sin(theta))
     out[0]=(R[2,1]-R[1,2])*k;out[1]=(R[0,2]-R[2,0])*k;out[2]=(R[1,0]-R[0,1])*k;return out
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, parallel=True)
 def _compute_visual_jacobians_jit(n_obs, P_world, obs_curr, p, R_imu_T, R_ci, t_ci, fx, fy, cx, cy, z_m, depth_max_m, H_total, r_total, W_huber, R_obs_diag):
-    for i in range(n_obs):
+    for i in prange(n_obs):
         p_w = P_world[i]
         p_curr_i = np.zeros(3)
         for j in range(3):

@@ -90,6 +90,10 @@ Execute this script post-mission on the host machine to process the acquired dat
 ```bash
 make reconstruct
 ```
+* **Reconstruction Modes:** You can easily switch between three performance profiles by changing `"reconstruction_mode"` in `src/config/config.json`:
+  * `"original"`: The baseline 4mm-5mm TSDF settings.
+  * `"ultra"`: Maxed-out 1.5mm TSDF resolution for top-tier workstations (utilizes uint8/uint16 TSDF memory quantization).
+  * `"balanced"`: 8mm-10mm TSDF resolution for fast iteration on mid-range laptops.
 * **Output:** `coral_mesh_mm.ply` (Dense 3D point cloud and mesh geometry).
 
 ---
