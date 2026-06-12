@@ -9,7 +9,7 @@ RUN := $(VENV)/bin/python
 PIP := $(RUN) -m pip
 endif
 
-.PHONY: venv install-pi install-laptop check record reconstruct regression regression-score
+.PHONY: venv install-pi install-station check record reconstruct regression regression-score
 
 venv:
 	$(PYTHON) -m venv $(VENV)
@@ -18,9 +18,9 @@ install-pi: venv
 	$(PIP) install --upgrade pip
 	$(PIP) install -e ".[pi]"
 
-install-laptop: venv
+install-station: venv
 	$(PIP) install --upgrade pip
-	$(PIP) install -e ".[laptop]"
+	$(PIP) install -e ".[station]"
 
 check:
 	find src/slam -name '*.py' -not -path '*/__pycache__/*' -print0 | xargs -0 $(PYTHON) -m py_compile
