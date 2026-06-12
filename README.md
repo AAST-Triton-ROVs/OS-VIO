@@ -52,7 +52,7 @@ cd OS-VIO
 make install-pi
 
 # Station laptop
-make install-laptop
+make install-station
 ```
 
 ---
