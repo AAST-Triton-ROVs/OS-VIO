@@ -38,12 +38,13 @@ The pipeline fuses high-frequency inertial data with stereo vision utilizing a 1
 ### Prerequisites
 * Python 3.8+
 * Luxonis OAK-D S2 (or equivalent DepthAI hardware)
-* Intel iGPU (Optional, required for OpenCL hardware-accelerated color correction)
+* edge compute companion computer (eg, raspberry pi 4/5, NVIDA Jetson Nano, or any equivalent hardware.)
+* CUDA GPU (prefered for accelerated offline reconstruction), or Intel iGPU (Optional, required for OpenCL hardware-accelerated color correction)
 
 ### Setup
 ```bash
-git clone [https://github.com/Marwan7042/slam.git](https://github.com/Marwan7042/slam.git)
-cd slam
+git clone [https://github.com/Marwan7042/OS-VIO.git](https://github.com/Marwan7042/OS-VIO.git)
+cd OS-VIO
 ```
 
 ```bash
